@@ -3,6 +3,11 @@ import { Router } from "express";
 import { query } from "../db.js";
 import { authRequired } from "../middleware/auth.js";
 import { z } from "zod";
+import { sendMail } from "../lib/mailer.js";
+
+const APP_NAME = process.env.APP_NAME || "GlobalCribs";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "johnindakwa6@gmail.com";
 
 const router = Router();
 
@@ -13,7 +18,13 @@ function shortFromUUID(id = "") {
   return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(-4)}`;
 }
 const OFFER_PREFIX = "OFFER::";
-const safeJson = (s) => { try { return JSON.parse(s); } catch { return null; } };
+const safeJson = (s) => {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+};
 const decodeOfferFromNote = (note) =>
   typeof note === "string" && note.startsWith(OFFER_PREFIX)
     ? safeJson(note.slice(OFFER_PREFIX.length))
@@ -21,21 +32,26 @@ const decodeOfferFromNote = (note) =>
 
 /* ---------- profile + payment syncing ---------- */
 
-const ProfilePatchSchema = z.object({
-  fullName: z.string().optional(),
-  email: z.string().email().optional(),
-  phone: z.string().optional(),
-  whatsapp: z.string().optional(),
-  addressLine1: z.string().optional(),
-  addressLine2: z.string().optional(),
-  addressCity: z.string().optional(),
-  addressCountry: z.string().optional(),
-  postal: z.string().optional(),
-}).partial();
+const ProfilePatchSchema = z
+  .object({
+    fullName: z.string().optional(),
+    email: z.string().email().optional(),
+    phone: z.string().optional(),
+    whatsapp: z.string().optional(),
+    addressLine1: z.string().optional(),
+    addressLine2: z.string().optional(),
+    addressCity: z.string().optional(),
+    addressCountry: z.string().optional(),
+    postal: z.string().optional(),
+  })
+  .partial();
 
 // ensure StudentProfile exists; return current row
 async function ensureProfile(userId) {
-  const { rows } = await query(`SELECT * FROM "StudentProfile" WHERE "userId"=$1`, [userId]);
+  const { rows } = await query(
+    `SELECT * FROM "StudentProfile" WHERE "userId"=$1`,
+    [userId]
+  );
   if (rows[0]) return rows[0];
   const { rows: created } = await query(
     `INSERT INTO "StudentProfile"(id,"userId","createdAt","updatedAt")
@@ -46,9 +62,17 @@ async function ensureProfile(userId) {
 }
 
 // Save/merge a payment method into StudentProfile.paymentMethods (jsonb)
-async function persistPaymentMethod(userId, method, details = {}, setDefault = true) {
+async function persistPaymentMethod(
+  userId,
+  method,
+  details = {},
+  setDefault = true
+) {
   const prof = await ensureProfile(userId);
-  const prev = prof.paymentMethods && typeof prof.paymentMethods === "object" ? prof.paymentMethods : {};
+  const prev =
+    prof.paymentMethods && typeof prof.paymentMethods === "object"
+      ? prof.paymentMethods
+      : {};
   const entry = {
     type: method, // "CARD" | "MPESA"
     ...details,
@@ -86,15 +110,20 @@ async function upsertProfilePatch(userId, patch = {}) {
     vals.push(v);
   }
   sets.push(`"updatedAt" = NOW()`);
-  await query(`UPDATE "StudentProfile" SET ${sets.join(", ")} WHERE "userId" = $1`, vals);
+  await query(
+    `UPDATE "StudentProfile" SET ${sets.join(", ")} WHERE "userId" = $1`,
+    vals
+  );
 }
 
 /* ---------- offer helpers ---------- */
 
 function offerTotals(offer) {
-  if (!offer || !Array.isArray(offer.lines)) return { dueNow: 0, dueLater: 0, all: 0 };
+  if (!offer || !Array.isArray(offer.lines))
+    return { dueNow: 0, dueLater: 0, all: 0 };
   const val = (n) => (Number.isFinite(n) ? n : 0);
-  let dueNow = 0, dueLater = 0;
+  let dueNow = 0,
+    dueLater = 0;
   for (const l of offer.lines) {
     const amt = val(l.amountCents);
     if (String(l.dueType).toUpperCase() === "NOW") dueNow += amt;
@@ -126,14 +155,19 @@ function presentBooking(b, withListing = false, opts = { offer: "none" }) {
   const ref = `BK-${shortFromUUID(b.id)}`;
   const listingRef = `LS-${shortFromUUID(b.listingId)}`;
   let base = { ...b, ref, listingRef };
-  if (withListing && b.listing) base = { ...base, listing: { ...b.listing, ref: listingRef } };
+  if (withListing && b.listing)
+    base = { ...base, listing: { ...b.listing, ref: listingRef } };
 
   const mode = opts.offer || "none";
-  const latestOfferRow = Array.isArray(b.offers) && b.offers[0] ? b.offers[0] : null;
+  const latestOfferRow =
+    Array.isArray(b.offers) && b.offers[0] ? b.offers[0] : null;
 
   if (mode === "summary") {
     const has = Boolean(latestOfferRow) || Boolean(decodeOfferFromNote(b.note));
-    const exp = latestOfferRow?.expiresAt || decodeOfferFromNote(b.note)?.expiresAt || null;
+    const exp =
+      latestOfferRow?.expiresAt ||
+      decodeOfferFromNote(b.note)?.expiresAt ||
+      null;
     base.hasPartnerOffer = has;
     base.partnerOfferExpiresAt = exp;
     base.hasOffer = has;
@@ -143,7 +177,13 @@ function presentBooking(b, withListing = false, opts = { offer: "none" }) {
       ? presentOfferFromRow(latestOfferRow)
       : (() => {
           const legacy = decodeOfferFromNote(b.note);
-          return legacy ? { status: legacy.status || "SENT", ...legacy, totals: offerTotals(legacy) } : null;
+          return legacy
+            ? {
+                status: legacy.status || "SENT",
+                ...legacy,
+                totals: offerTotals(legacy),
+              }
+            : null;
         })();
     base.partnerOffer = full;
     base.offer = full;
@@ -181,10 +221,14 @@ function ensureStudent(req, res) {
 }
 
 async function mustOwnBooking(id, userId) {
-  const { rows } = await query(`SELECT id,"studentId" FROM "Booking" WHERE id=$1`, [id]);
+  const { rows } = await query(
+    `SELECT id,"studentId" FROM "Booking" WHERE id=$1`,
+    [id]
+  );
   const b = rows[0];
   if (!b) return { ok: false, status: 404, error: "Booking not found" };
-  if (b.studentId !== userId) return { ok: false, status: 403, error: "Forbidden" };
+  if (b.studentId !== userId)
+    return { ok: false, status: 403, error: "Forbidden" };
   return { ok: true, booking: b };
 }
 
@@ -252,7 +296,11 @@ async function listBookingsForStudent(studentId, take, skip) {
     `,
     [studentId, take, skip]
   );
-  return rows.map((r) => ({ ...r, listing: r.listing, offers: r.offers || [] }));
+  return rows.map((r) => ({
+    ...r,
+    listing: r.listing,
+    offers: r.offers || [],
+  }));
 }
 
 /* ---------- routes ---------- */
@@ -267,10 +315,14 @@ router.get("/", authRequired, async (req, res) => {
   try {
     const [itemsRaw, countRes] = await Promise.all([
       listBookingsForStudent(req.user.id, take, skip),
-      query(`SELECT COUNT(*)::int AS c FROM "Booking" WHERE "studentId"=$1`, [req.user.id]),
+      query(`SELECT COUNT(*)::int AS c FROM "Booking" WHERE "studentId"=$1`, [
+        req.user.id,
+      ]),
     ]);
 
-    const items = itemsRaw.map((b) => presentBooking(b, true, { offer: "summary" }));
+    const items = itemsRaw.map((b) =>
+      presentBooking(b, true, { offer: "summary" })
+    );
     res.json({ items, total: countRes.rows[0].c, take, skip });
   } catch (e) {
     console.error("GET /api/student/bookings error:", e.message, e.detail);
@@ -295,15 +347,18 @@ router.get("/:id", authRequired, async (req, res) => {
   }
 });
 
-// CREATE booking  — also sync profile if provided
+// CREATE booking  — also sync profile if provided + email student to pay fee
 router.post("/", authRequired, async (req, res) => {
   if (!ensureStudent(req, res)) return;
   const parsed = CreateBookingBody.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  if (!parsed.success)
+    return res.status(400).json({ error: parsed.error.flatten() });
 
   try {
     // listing exists?
-    const { rows: lst } = await query(`SELECT id FROM "Listing" WHERE id=$1`, [parsed.data.listingId]);
+    const { rows: lst } = await query(`SELECT id FROM "Listing" WHERE id=$1`, [
+      parsed.data.listingId,
+    ]);
     if (!lst[0]) return res.status(404).json({ error: "Listing not found" });
 
     if (parsed.data.profilePatch) {
@@ -332,7 +387,51 @@ router.post("/", authRequired, async (req, res) => {
     );
 
     const b = await loadBookingWithRelations(rows[0].id);
-    res.status(201).json({ item: presentBooking(b, true, { offer: "full" }) });
+    const item = presentBooking(b, true, { offer: "full" });
+
+    // fire-and-forget student email (do not block the response)
+    (async () => {
+      try {
+        const { rows: urows } = await query(
+          `SELECT name, email FROM "User" WHERE id = $1`,
+          [req.user.id]
+        );
+        const student = urows[0] || {};
+        const ref = `BK-${shortFromUUID(item.id)}`;
+        const listingTitle =
+          item?.listing?.title || item.listingRef || "Your listing";
+        const when = `${item.checkIn} → ${item.checkOut}`;
+        const url = `${FRONTEND_URL}/dashboard/student/bookings/${item.id}`;
+
+        const subject = `${APP_NAME}: booking received (${ref}) — action needed`;
+        const text = [
+          `Hi ${student.name || "there"},`,
+          ``,
+          `We’ve received your booking ${ref} for "${listingTitle}" (${when}).`,
+          `To proceed, please pay the application/registration fee in your dashboard:`,
+          `${url}`,
+          ``,
+          `We’ll notify you when it’s ready to submit to the partner.`,
+          ``,
+          `— ${APP_NAME} Team`,
+        ].join("\n");
+
+        const html = `
+          <p>Hi ${student.name || "there"},</p>
+          <p>We’ve received your booking <b>${ref}</b> for “${listingTitle}” (<b>${when}</b>).</p>
+          <p><b>Next step:</b> please pay the application/registration fee in your dashboard.</p>
+          <p><a href="${url}">Open your booking</a></p>
+          <p>We’ll notify you when it’s ready to submit to the partner.</p>
+          <p>— ${APP_NAME} Team</p>
+        `;
+
+        await sendMail({ to: student.email, subject, text, html });
+      } catch (e) {
+        console.error("email(student booking received) failed:", e);
+      }
+    })();
+
+    return res.status(201).json({ item });
   } catch (e) {
     console.error("POST /api/student/bookings error:", e.message, e.detail);
     res.status(500).json({ error: "Internal server error" });
@@ -343,7 +442,8 @@ router.post("/", authRequired, async (req, res) => {
 router.patch("/:id", authRequired, async (req, res) => {
   if (!ensureStudent(req, res)) return;
   const parsed = UpdateBookingBody.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  if (!parsed.success)
+    return res.status(400).json({ error: parsed.error.flatten() });
 
   const chk = await mustOwnBooking(req.params.id, req.user.id);
   if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
@@ -358,21 +458,38 @@ router.patch("/:id", authRequired, async (req, res) => {
     const vals = [];
     let i = 1;
 
-    if ("checkIn" in parsed.data) { set.push(`"checkIn" = $${i++}`); vals.push(parsed.data.checkIn ?? null); }
-    if ("checkOut" in parsed.data) { set.push(`"checkOut" = $${i++}`); vals.push(parsed.data.checkOut ?? null); }
-    if ("note" in parsed.data) { set.push(`note = $${i++}`); vals.push(parsed.data.note ?? null); }
+    if ("checkIn" in parsed.data) {
+      set.push(`"checkIn" = $${i++}`);
+      vals.push(parsed.data.checkIn ?? null);
+    }
+    if ("checkOut" in parsed.data) {
+      set.push(`"checkOut" = $${i++}`);
+      vals.push(parsed.data.checkOut ?? null);
+    }
+    if ("note" in parsed.data) {
+      set.push(`note = $${i++}`);
+      vals.push(parsed.data.note ?? null);
+    }
     if ("docIds" in parsed.data) {
-      set.push(`"docIds" = $${i++}::text[]`); vals.push(parsed.data.docIds ?? null);
+      set.push(`"docIds" = $${i++}::text[]`);
+      vals.push(parsed.data.docIds ?? null);
       set.push(`"docsUpdatedAt" = NOW()`);
     }
     set.push(`"updatedAt" = NOW()`);
 
-    await query(`UPDATE "Booking" SET ${set.join(", ")} WHERE id = $${i}`, [...vals, req.params.id]);
+    await query(`UPDATE "Booking" SET ${set.join(", ")} WHERE id = $${i}`, [
+      ...vals,
+      req.params.id,
+    ]);
 
     const b = await loadBookingWithRelations(req.params.id);
     res.json({ item: presentBooking(b, true, { offer: "full" }) });
   } catch (e) {
-    console.error("PATCH /api/student/bookings/:id error:", e.message, e.detail);
+    console.error(
+      "PATCH /api/student/bookings/:id error:",
+      e.message,
+      e.detail
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -383,19 +500,25 @@ router.post("/:id/pay", authRequired, async (req, res) => {
 
   const PayBody = z.object({
     method: z.enum(["CARD", "MPESA"]),
-    details: z.object({
-      brand: z.string().optional(),
-      last4: z.string().regex(/^\d{2,4}$/).optional(),
-      expMonth: z.number().int().min(1).max(12).optional(),
-      expYear: z.number().int().min(2000).max(2100).optional(),
-      name: z.string().optional(),
-      billingEmail: z.string().email().optional(),
-      mpesaPhone: z.string().optional(),
-    }).optional(),
+    details: z
+      .object({
+        brand: z.string().optional(),
+        last4: z
+          .string()
+          .regex(/^\d{2,4}$/)
+          .optional(),
+        expMonth: z.number().int().min(1).max(12).optional(),
+        expYear: z.number().int().min(2000).max(2100).optional(),
+        name: z.string().optional(),
+        billingEmail: z.string().email().optional(),
+        mpesaPhone: z.string().optional(),
+      })
+      .optional(),
     saveToProfile: z.boolean().optional().default(true),
   });
   const parsed = PayBody.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  if (!parsed.success)
+    return res.status(400).json({ error: parsed.error.flatten() });
 
   const chk = await mustOwnBooking(req.params.id, req.user.id);
   if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
@@ -408,7 +531,9 @@ router.post("/:id/pay", authRequired, async (req, res) => {
     const current = rows[0];
 
     if (!current.feePaidAt) {
-      const docsCount = Array.isArray(current.docIds) ? current.docIds.length : 0;
+      const docsCount = Array.isArray(current.docIds)
+        ? current.docIds.length
+        : 0;
       const nextStatus = docsCount > 0 ? "READY_TO_SUBMIT" : "PAYMENT_COMPLETE";
       await query(
         `UPDATE "Booking"
@@ -417,16 +542,31 @@ router.post("/:id/pay", authRequired, async (req, res) => {
         [req.params.id, parsed.data.method, nextStatus]
       );
       if (parsed.data.saveToProfile) {
-        await persistPaymentMethod(req.user.id, parsed.data.method, parsed.data.details || {}, true);
+        await persistPaymentMethod(
+          req.user.id,
+          parsed.data.method,
+          parsed.data.details || {},
+          true
+        );
       }
     } else if (parsed.data.saveToProfile) {
-      await persistPaymentMethod(req.user.id, parsed.data.method, parsed.data.details || {}, false);
+      await persistPaymentMethod(
+        req.user.id,
+        parsed.data.method,
+        parsed.data.details || {},
+        false
+      );
     }
 
-    const b = await loadBookingWithRelations(req.params.id);
-    res.json({ item: presentBooking(b, true, { offer: "full" }) });
+    const b = await loadBookingWithRelations(chk.booking.id); // correct id
+    const item = presentBooking(b, true, { offer: "full" });
+    return res.json({ item });
   } catch (e) {
-    console.error("POST /api/student/bookings/:id/pay error:", e.message, e.detail);
+    console.error(
+      "POST /api/student/bookings/:id/pay error:",
+      e.message,
+      e.detail
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -437,19 +577,25 @@ router.post("/:id/offer/pay", authRequired, async (req, res) => {
 
   const PayBody = z.object({
     method: z.enum(["CARD", "MPESA"]),
-    details: z.object({
-      brand: z.string().optional(),
-      last4: z.string().regex(/^\d{2,4}$/).optional(),
-      expMonth: z.number().int().min(1).max(12).optional(),
-      expYear: z.number().int().min(2000).max(2100).optional(),
-      name: z.string().optional(),
-      billingEmail: z.string().email().optional(),
-      mpesaPhone: z.string().optional(),
-    }).optional(),
+    details: z
+      .object({
+        brand: z.string().optional(),
+        last4: z
+          .string()
+          .regex(/^\d{2,4}$/)
+          .optional(),
+        expMonth: z.number().int().min(1).max(12).optional(),
+        expYear: z.number().int().min(2000).max(2100).optional(),
+        name: z.string().optional(),
+        billingEmail: z.string().email().optional(),
+        mpesaPhone: z.string().optional(),
+      })
+      .optional(),
     saveToProfile: z.boolean().optional().default(true),
   });
   const parsed = PayBody.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+  if (!parsed.success)
+    return res.status(400).json({ error: parsed.error.flatten() });
 
   const chk = await mustOwnBooking(req.params.id, req.user.id);
   if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
@@ -474,18 +620,27 @@ router.post("/:id/offer/pay", authRequired, async (req, res) => {
     );
 
     if (parsed.data.saveToProfile) {
-      await persistPaymentMethod(req.user.id, parsed.data.method, parsed.data.details || {}, false);
+      await persistPaymentMethod(
+        req.user.id,
+        parsed.data.method,
+        parsed.data.details || {},
+        false
+      );
     }
 
     const b = await loadBookingWithRelations(chk.booking.id);
     res.json({ item: presentBooking(b, true, { offer: "full" }) });
   } catch (e) {
-    console.error("POST /api/student/bookings/:id/offer/pay error:", e.message, e.detail);
+    console.error(
+      "POST /api/student/bookings/:id/offer/pay error:",
+      e.message,
+      e.detail
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// SUBMIT booking (fee must be paid + at least 1 doc)
+// SUBMIT booking (fee must be paid + at least 1 doc) — email admin
 router.post("/:id/submit", authRequired, async (req, res) => {
   if (!ensureStudent(req, res)) return;
 
@@ -500,8 +655,10 @@ router.post("/:id/submit", authRequired, async (req, res) => {
     const b = rows[0];
     const docsCount = Array.isArray(b.docIds) ? b.docIds.length : 0;
 
-    if (!b.feePaidAt) return res.status(400).json({ error: "Application fee not paid" });
-    if (docsCount === 0) return res.status(400).json({ error: "Attach at least one document" });
+    if (!b.feePaidAt)
+      return res.status(400).json({ error: "Application fee not paid" });
+    if (docsCount === 0)
+      return res.status(400).json({ error: "Attach at least one document" });
 
     await query(
       `UPDATE "Booking"
@@ -511,9 +668,62 @@ router.post("/:id/submit", authRequired, async (req, res) => {
     );
 
     const out = await loadBookingWithRelations(chk.booking.id);
-    res.json({ item: presentBooking(out, true, { offer: "full" }) });
+    const item = presentBooking(out, true, { offer: "full" });
+
+    // fire-and-forget admin email
+    (async () => {
+      try {
+        const { rows: urows } = await query(
+          `SELECT name, email FROM "User" WHERE id = $1`,
+          [out.studentId]
+        );
+        const student = urows[0] || {};
+        const ref = `BK-${shortFromUUID(item.id)}`;
+        const listingTitle =
+          item?.listing?.title || item.listingRef || "Listing";
+        const when = `${item.checkIn} → ${item.checkOut}`;
+        const adminUrl = `${FRONTEND_URL}/admin/bookings/${item.id}`;
+
+        const subject = `${APP_NAME}: new submitted booking (${ref}) — fee paid`;
+        const text = [
+          `A booking has been submitted for consideration.`,
+          ``,
+          `Ref: ${ref}`,
+          `Student: ${student.name || ""} <${student.email || ""}>`,
+          `Listing: ${listingTitle}`,
+          `Dates: ${when}`,
+          `Application fee: PAID`,
+          ``,
+          `Open admin: ${adminUrl}`,
+        ].join("\n");
+
+        const html = `
+          <p><b>New submitted booking</b> (fee paid)</p>
+          <ul>
+            <li><b>Ref:</b> ${ref}</li>
+            <li><b>Student:</b> ${student.name || ""} &lt;${
+              student.email || ""
+            }&gt;</li>
+            <li><b>Listing:</b> ${listingTitle}</li>
+            <li><b>Dates:</b> ${when}</li>
+            <li><b>Application fee:</b> PAID</li>
+          </ul>
+          <p><a href="${adminUrl}">Open in Admin</a></p>
+        `;
+
+        await sendMail({ to: ADMIN_EMAIL, subject, text, html });
+      } catch (e) {
+        console.error("email(admin submit notice) failed:", e);
+      }
+    })();
+
+    return res.json({ item });
   } catch (e) {
-    console.error("POST /api/student/bookings/:id/submit error:", e.message, e.detail);
+    console.error(
+      "POST /api/student/bookings/:id/submit error:",
+      e.message,
+      e.detail
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -543,7 +753,11 @@ router.post("/:id/offer/accept", authRequired, async (req, res) => {
     const b = await loadBookingWithRelations(chk.booking.id);
     res.json({ item: presentBooking(b, true, { offer: "full" }) });
   } catch (e) {
-    console.error("POST /api/student/bookings/:id/offer/accept error:", e.message, e.detail);
+    console.error(
+      "POST /api/student/bookings/:id/offer/accept error:",
+      e.message,
+      e.detail
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -573,7 +787,11 @@ router.post("/:id/offer/decline", authRequired, async (req, res) => {
     const b = await loadBookingWithRelations(chk.booking.id);
     res.json({ item: presentBooking(b, true, { offer: "full" }) });
   } catch (e) {
-    console.error("POST /api/student/bookings/:id/offer/decline error:", e.message, e.detail);
+    console.error(
+      "POST /api/student/bookings/:id/offer/decline error:",
+      e.message,
+      e.detail
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });

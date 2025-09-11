@@ -1,8 +1,12 @@
 // src/routes/agent.applications.js
 import { Router } from "express";
 import { query } from "../db.js";
+import { sendMail } from "../lib/mailer.js";
 
 const router = Router();
+
+const APP_NAME = process.env.APP_NAME || "GlobalCribs";
+const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 
 /* ---------------- helpers ---------------- */
 
@@ -19,6 +23,15 @@ const decodeOfferFromNote = (note) =>
   typeof note === "string" && note.startsWith(OFFER_PREFIX)
     ? safeJson(note.slice(OFFER_PREFIX.length))
     : null;
+
+// short ref like BK-ABCD-1234-9XYZ
+function shortFromUUID(id = "") {
+  const s = String(id).replace(/-/g, "").toUpperCase();
+  if (s.length < 12) return s || "XXXX";
+  return `${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(-4)}`;
+}
+const prettyBookingRef = (id) => `BK-${shortFromUUID(id)}`;
+const prettyListingRef = (id) => `LS-${shortFromUUID(id)}`;
 
 // gate: AGENT or ADMIN (SUPERADMIN counts as admin)
 function ensureAgentOrAdmin(req, res, next) {
@@ -255,6 +268,7 @@ router.get("/:id", ensureAgentOrAdmin, async (req, res) => {
 });
 
 // CONFIRM / SEND OFFER → create Offer row (+ set booking APPROVED for stage label)
+// Also: email the student that an offer is ready.
 router.post("/:id/confirm", ensureAgentOrAdmin, async (req, res) => {
   try {
     const agentId = req.user.id;
@@ -307,6 +321,52 @@ router.post("/:id/confirm", ensureAgentOrAdmin, async (req, res) => {
       );
       docs = drows;
     }
+
+    // Fire-and-forget: email the student that an offer is ready
+    (async () => {
+      try {
+        const ref = prettyBookingRef(b.id);
+        const listingTitle = b?.listing?.title || prettyListingRef(b.listingId) || "your listing";
+        const when =
+          b.checkIn && b.checkOut ? `${b.checkIn} → ${b.checkOut}` : "your requested dates";
+        const studentName = b?.student?.name || b?.student?.email?.split("@")[0] || "there";
+        const studentEmail = b?.student?.email;
+        const expiresAt =
+          (Array.isArray(b.offers) && b.offers[0] && b.offers[0].expiresAt) || null;
+
+        if (studentEmail) {
+          const subject = `${APP_NAME}: Offer ready for your booking (${ref})`;
+          const url = `${FRONTEND_URL}/dashboard/student/bookings/${encodeURIComponent(b.id)}`;
+
+          const text = [
+            `Hi ${studentName},`,
+            ``,
+            `Good news — a partner offer has been issued for your booking ${ref} (${listingTitle}).`,
+            `Dates: ${when}`,
+            expiresAt ? `Offer expiry: ${new Date(expiresAt).toLocaleString()}` : null,
+            ``,
+            `Review the details and continue in your dashboard:`,
+            url,
+            ``,
+            `— ${APP_NAME} Team`,
+          ]
+            .filter(Boolean)
+            .join("\n");
+
+          const html = `
+            <p>Hi ${studentName},</p>
+            <p>Good news — a partner offer has been issued for your booking <b>${ref}</b> (<i>${listingTitle}</i>).</p>
+            <p><b>Dates:</b> ${when}${expiresAt ? `<br/><b>Offer expiry:</b> ${new Date(expiresAt).toLocaleString()}` : ""}</p>
+            <p><a href="${url}">Open your booking</a> to review and continue.</p>
+            <p>— ${APP_NAME} Team</p>
+          `;
+
+          await sendMail({ to: studentEmail, subject, text, html });
+        }
+      } catch (err) {
+        console.error("email(student offer ready) failed:", err);
+      }
+    })();
 
     res.json({ item: toDetail(b, docs) });
   } catch (e) {

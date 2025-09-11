@@ -78,82 +78,79 @@ router.put("/students/me/profile", authRequired, async (req, res) => {
   }
   const d = parsed.data;
 
-  // Build param list EXACTLY in the order used by the VALUES placeholders.
+  // 1) Make sure a row exists (no mass NULLs on first save)
+  await query(
+    `
+    INSERT INTO "StudentProfile"(id, "userId", "createdAt", "updatedAt")
+    VALUES (gen_random_uuid()::text, $1, NOW(), NOW())
+    ON CONFLICT ("userId") DO NOTHING
+    `,
+    [userId]
+  );
+
+  // helper: only update if the key was present in the JSON body
+  const has = (k) => Object.prototype.hasOwnProperty.call(d, k);
+
   const vals = [
-    userId,                               // $1
-    d.fullName ?? null,                   // $2
-    d.email ?? null,                      // $3
-    d.avatarUrl ?? null,                  // $4
-    d.dob ?? null,                        // $5
-    d.nationality ?? null,                // $6
-    d.passportNo ?? null,                 // $7
-    d.school ?? null,                     // $8
-    d.program ?? null,                    // $9
-    d.intake ?? null,                     // $10
-    d.targetCity ?? null,                 // $11
-    d.phone ?? null,                      // $12
-    d.whatsapp ?? null,                   // $13
-    d.addressLine1 ?? null,               // $14
-    d.addressLine2 ?? null,               // $15
-    d.addressCity ?? null,                // $16
-    d.addressCountry ?? null,             // $17
-    d.postal ?? null,                     // $18
-    d.emergencyName ?? null,              // $19
-    d.emergencyRelation ?? null,          // $20
-    d.emergencyPhone ?? null,             // $21
-    d.commsEmail ?? false,                // $22
-    d.commsSMS ?? false,                  // $23
-    d.commsWhatsApp ?? false,             // $24
-    d.kycStatus ?? "NOT_STARTED",         // $25
-    d.paymentMethods ? JSON.stringify(d.paymentMethods) : null, // $26
+    userId,                                       // $1
+    has("fullName")       ? d.fullName       : null, // $2
+    has("email")          ? d.email          : null, // $3
+    has("avatarUrl")      ? d.avatarUrl      : null, // $4
+    has("dob")            ? d.dob            : null, // $5
+    has("nationality")    ? d.nationality    : null, // $6
+    has("passportNo")     ? d.passportNo     : null, // $7
+    has("school")         ? d.school         : null, // $8
+    has("program")        ? d.program        : null, // $9
+    has("intake")         ? d.intake         : null, // $10
+    has("targetCity")     ? d.targetCity     : null, // $11
+    has("phone")          ? d.phone          : null, // $12
+    has("whatsapp")       ? d.whatsapp       : null, // $13
+    has("addressLine1")   ? d.addressLine1   : null, // $14
+    has("addressLine2")   ? d.addressLine2   : null, // $15
+    has("addressCity")    ? d.addressCity    : null, // $16
+    has("addressCountry") ? d.addressCountry : null, // $17
+    has("postal")         ? d.postal         : null, // $18
+    has("emergencyName")      ? d.emergencyName      : null, // $19
+    has("emergencyRelation")  ? d.emergencyRelation  : null, // $20
+    has("emergencyPhone")     ? d.emergencyPhone     : null, // $21
+    has("commsEmail")     ? d.commsEmail     : null, // $22 (boolean ok)
+    has("commsSMS")       ? d.commsSMS       : null, // $23
+    has("commsWhatsApp")  ? d.commsWhatsApp  : null, // $24
+    has("kycStatus")      ? d.kycStatus      : null, // $25
+    has("paymentMethods") ? JSON.stringify(d.paymentMethods) : null, // $26
   ];
 
+  // 2) Partial UPDATE — only touch fields whose param is NOT NULL
   const { rows } = await query(
     `
-    INSERT INTO "StudentProfile" (
-      "id","userId","fullName","email","avatarUrl","dob","nationality","passportNo",
-      "school","program","intake","targetCity","phone","whatsapp",
-      "addressLine1","addressLine2","addressCity","addressCountry","postal",
-      "emergencyName","emergencyRelation","emergencyPhone",
-      "commsEmail","commsSMS","commsWhatsApp",
-      "kycStatus","paymentMethods","createdAt","updatedAt"
-    )
-    VALUES (
-      gen_random_uuid()::text,
-      $1,$2,$3,$4,$5,$6,$7,
-      $8,$9,$10,$11,$12,$13,
-      $14,$15,$16,$17,$18,
-      $19,$20,$21,
-      $22,$23,$24,
-      $25, CAST($26 AS JSONB), NOW(), NOW()
-    )
-    ON CONFLICT ("userId") DO UPDATE SET
-      "fullName" = EXCLUDED."fullName",
-      "email" = EXCLUDED."email",
-      "avatarUrl" = EXCLUDED."avatarUrl",
-      "dob" = EXCLUDED."dob",
-      "nationality" = EXCLUDED."nationality",
-      "passportNo" = EXCLUDED."passportNo",
-      "school" = EXCLUDED."school",
-      "program" = EXCLUDED."program",
-      "intake" = EXCLUDED."intake",
-      "targetCity" = EXCLUDED."targetCity",
-      "phone" = EXCLUDED."phone",
-      "whatsapp" = EXCLUDED."whatsapp",
-      "addressLine1" = EXCLUDED."addressLine1",
-      "addressLine2" = EXCLUDED."addressLine2",
-      "addressCity" = EXCLUDED."addressCity",
-      "addressCountry" = EXCLUDED."addressCountry",
-      "postal" = EXCLUDED."postal",
-      "emergencyName" = EXCLUDED."emergencyName",
-      "emergencyRelation" = EXCLUDED."emergencyRelation",
-      "emergencyPhone" = EXCLUDED."emergencyPhone",
-      "commsEmail" = EXCLUDED."commsEmail",
-      "commsSMS" = EXCLUDED."commsSMS",
-      "commsWhatsApp" = EXCLUDED."commsWhatsApp",
-      "kycStatus" = EXCLUDED."kycStatus",
-      "paymentMethods" = EXCLUDED."paymentMethods",
+    UPDATE "StudentProfile" SET
+      "fullName"       = COALESCE($2,  "fullName"),
+      "email"          = COALESCE($3,  "email"),
+      "avatarUrl"      = COALESCE($4,  "avatarUrl"),
+      "dob"            = COALESCE($5,  "dob"),
+      "nationality"    = COALESCE($6,  "nationality"),
+      "passportNo"     = COALESCE($7,  "passportNo"),
+      "school"         = COALESCE($8,  "school"),
+      "program"        = COALESCE($9,  "program"),
+      "intake"         = COALESCE($10, "intake"),
+      "targetCity"     = COALESCE($11, "targetCity"),
+      "phone"          = COALESCE($12, "phone"),
+      "whatsapp"       = COALESCE($13, "whatsapp"),
+      "addressLine1"   = COALESCE($14, "addressLine1"),
+      "addressLine2"   = COALESCE($15, "addressLine2"),
+      "addressCity"    = COALESCE($16, "addressCity"),
+      "addressCountry" = COALESCE($17, "addressCountry"),
+      "postal"         = COALESCE($18, "postal"),
+      "emergencyName"      = COALESCE($19, "emergencyName"),
+      "emergencyRelation"  = COALESCE($20, "emergencyRelation"),
+      "emergencyPhone"     = COALESCE($21, "emergencyPhone"),
+      "commsEmail"     = COALESCE($22, "commsEmail"),
+      "commsSMS"       = COALESCE($23, "commsSMS"),
+      "commsWhatsApp"  = COALESCE($24, "commsWhatsApp"),
+      "kycStatus"      = COALESCE($25, "kycStatus"),
+      "paymentMethods" = COALESCE(CAST($26 AS JSONB), "paymentMethods"),
       "updatedAt" = NOW()
+    WHERE "userId" = $1
     RETURNING *;
     `,
     vals
@@ -161,6 +158,7 @@ router.put("/students/me/profile", authRequired, async (req, res) => {
 
   res.json({ profile: rows[0] });
 });
+
 
 /* -------------------- AGENT -------------------- */
 
@@ -313,63 +311,84 @@ router.put("/agents/me/profile", authRequired, async (req, res) => {
   }
   const d = parsed.data;
 
-  const { rows } = await query(
-    `
-    INSERT INTO "AgentProfile" (
-      id, "userId", first, last, email, phone, city,
-      "orgName", website, "supportEmail",
-      "payoutMethod", "bankName", "accountName", "accountNumber", branch,
-      "prefsTimezone", "prefsCurrency", "prefsUnit",
-      "notifyNewInquiry", "notifyDocUploaded", "notifyOfferEmailed",
-      "notifyPayoutPaid", "notifyWeeklyDigest",
-      "updatedAt", "createdAt"
-    ) VALUES (
-      gen_random_uuid()::text, $1, $2, $3, $4, $5, $6,
-      $7, $8, $9,
-      $10, $11, $12, $13, $14,
-      $15, $16, $17,
-      $18, $19, $20,
-      $21, $22,
-      NOW(), NOW()
-    )
-    ON CONFLICT ("userId") DO UPDATE SET
-      first = EXCLUDED.first,
-      last = EXCLUDED.last,
-      email = EXCLUDED.email,
-      phone = EXCLUDED.phone,
-      city = EXCLUDED.city,
-      "orgName" = EXCLUDED."orgName",
-      website = EXCLUDED.website,
-      "supportEmail" = EXCLUDED."supportEmail",
-      "payoutMethod" = EXCLUDED."payoutMethod",
-      "bankName" = EXCLUDED."bankName",
-      "accountName" = EXCLUDED."accountName",
-      "accountNumber" = EXCLUDED."accountNumber",
-      branch = EXCLUDED.branch,
-      "prefsTimezone" = EXCLUDED."prefsTimezone",
-      "prefsCurrency" = EXCLUDED."prefsCurrency",
-      "prefsUnit" = EXCLUDED."prefsUnit",
-      "notifyNewInquiry" = EXCLUDED."notifyNewInquiry",
-      "notifyDocUploaded" = EXCLUDED."notifyDocUploaded",
-      "notifyOfferEmailed" = EXCLUDED."offerEmailed",
-      "notifyPayoutPaid" = EXCLUDED."notifyPayoutPaid",
-      "notifyWeeklyDigest" = EXCLUDED."notifyWeeklyDigest",
-      "updatedAt" = NOW()
-    RETURNING *;
-    `,
-    [
-      userId,
-      d.first ?? null, d.last ?? null, d.email ?? null, d.phone ?? null, d.city ?? null,
-      d.orgName ?? null, d.website ?? null, d.supportEmail ?? null,
-      d.payoutMethod ?? "BANK", d.bankName ?? null, d.accountName ?? null,
-      d.accountNumber ?? null, d.branch ?? null,
-      d.prefsTimezone ?? "Africa/Nairobi", d.prefsCurrency ?? "USD", d.prefsUnit ?? "IMPERIAL",
-      d.notifyNewInquiry ?? true, d.notifyDocUploaded ?? true, d.notifyOfferEmailed ?? true,
-      d.notifyPayoutPaid ?? true, d.notifyWeeklyDigest ?? false
-    ]
-  );
+  try {
+    // 1) Ensure a row exists (no accidental wipes on first save)
+    await query(
+      `
+      INSERT INTO "AgentProfile"(id, "userId", "createdAt", "updatedAt")
+      VALUES (gen_random_uuid()::text, $1, NOW(), NOW())
+      ON CONFLICT ("userId") DO NOTHING
+      `,
+      [userId]
+    );
 
-  res.json({ profile: rows[0] });
+    // Only update keys that were actually provided in this request
+    const has = (k) => Object.prototype.hasOwnProperty.call(d, k);
+
+    const vals = [
+      userId,                                       // $1
+      has("first")            ? d.first            : null, // $2
+      has("last")             ? d.last             : null, // $3
+      has("email")            ? d.email            : null, // $4
+      has("phone")            ? d.phone            : null, // $5
+      has("city")             ? d.city             : null, // $6
+      has("orgName")          ? d.orgName          : null, // $7
+      has("website")          ? d.website          : null, // $8
+      has("supportEmail")     ? d.supportEmail     : null, // $9
+      has("payoutMethod")     ? (d.payoutMethod || "BANK") : null, // $10
+      has("bankName")         ? d.bankName         : null, // $11
+      has("accountName")      ? d.accountName      : null, // $12
+      has("accountNumber")    ? d.accountNumber    : null, // $13
+      has("branch")           ? d.branch           : null, // $14
+      has("prefsTimezone")    ? d.prefsTimezone    : null, // $15
+      has("prefsCurrency")    ? d.prefsCurrency    : null, // $16
+      has("prefsUnit")        ? d.prefsUnit        : null, // $17
+      has("notifyNewInquiry") ? d.notifyNewInquiry : null, // $18
+      has("notifyDocUploaded")? d.notifyDocUploaded: null, // $19
+      has("notifyOfferEmailed")? d.notifyOfferEmailed: null, // $20
+      has("notifyPayoutPaid") ? d.notifyPayoutPaid : null, // $21
+      has("notifyWeeklyDigest")? d.notifyWeeklyDigest: null, // $22
+    ];
+
+    // 2) Partial update: keep existing values when param is NULL
+    const { rows } = await query(
+      `
+      UPDATE "AgentProfile" SET
+        first              = COALESCE($2,  first),
+        last               = COALESCE($3,  last),
+        email              = COALESCE($4,  email),
+        phone              = COALESCE($5,  phone),
+        city               = COALESCE($6,  city),
+        "orgName"          = COALESCE($7,  "orgName"),
+        website            = COALESCE($8,  website),
+        "supportEmail"     = COALESCE($9,  "supportEmail"),
+        "payoutMethod"     = COALESCE($10, "payoutMethod"),
+        "bankName"         = COALESCE($11, "bankName"),
+        "accountName"      = COALESCE($12, "accountName"),
+        "accountNumber"    = COALESCE($13, "accountNumber"),
+        branch             = COALESCE($14, branch),
+        "prefsTimezone"    = COALESCE($15, "prefsTimezone"),
+        "prefsCurrency"    = COALESCE($16, "prefsCurrency"),
+        "prefsUnit"        = COALESCE($17, "prefsUnit"),
+        "notifyNewInquiry" = COALESCE($18, "notifyNewInquiry"),
+        "notifyDocUploaded"= COALESCE($19, "notifyDocUploaded"),
+        "notifyOfferEmailed"= COALESCE($20, "notifyOfferEmailed"),
+        "notifyPayoutPaid" = COALESCE($21, "notifyPayoutPaid"),
+        "notifyWeeklyDigest"= COALESCE($22, "notifyWeeklyDigest"),
+        "updatedAt" = NOW()
+      WHERE "userId" = $1
+      RETURNING *;
+      `,
+      vals
+    );
+
+    res.json({ profile: rows[0] });
+  } catch (e) {
+    console.error("PUT /agents/me/profile failed:", e);
+    res.status(500).json({ error: e.message || "Internal server error" });
+  }
 });
+
+
 
 export default router;
