@@ -21,6 +21,11 @@ import adminAgentsRouter from "./routes/admin.agents.js";
 import adminListingsRouter from "./routes/admin.listings.js";
 import adminSettingsRouter from "./routes/admin.settings.js";
 import healthSql from "./routes/health.sql.js";
+import supportTicketsRoutes from "./routes/support.tickets.js";
+import adminInquiriesRoutes from "./routes/admin.inquiries.js";
+import agentOverviewRoutes from "./routes/agent.overview.js";
+import studentMessagesRoutes from "./routes/student.messages.js";
+
 
 // NEW: agent KYC docs (upload/list/delete)
 import agentDocsRoutes from "./routes/agent.docs.js";
@@ -138,6 +143,13 @@ app.use("/api/admin/students", adminStudentsRouter);
 app.use("/api/admin/agents", adminAgentsRouter);
 app.use("/api/admin/listings", adminListingsRouter);
 app.use("/api/admin/settings", adminSettingsRouter);
+app.use("/api/agent/overview", agentOverviewRoutes);
+app.use("/api/student/messages", studentMessagesRoutes);
+
+
+app.use("/api/support", supportTicketsRoutes);        
+app.use("/api/admin/inquiries", adminInquiriesRoutes);  
+
 
 app.use("/health-sql", healthSql);
 

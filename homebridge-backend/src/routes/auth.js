@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { z } from "zod";
 import { query, tx } from "../db.js";
+import crypto from "crypto";
 import { authRequired } from "../middleware/auth.js";
 
 import { OAuth2Client } from "google-auth-library";
@@ -402,9 +403,9 @@ router.post("/reset-password", async (req, res) => {
 });
 
 
+
 /** GET /api/auth/google
  * Redirects to Google consent. Carries `role` and `from` in a signed state token.
- * Frontend currently calls this via window.location.href.
  */
 router.get("/google", async (req, res) => {
   const role = String(req.query.role || "").toUpperCase() === "AGENT" ? "AGENT" : "STUDENT";
@@ -423,8 +424,8 @@ router.get("/google", async (req, res) => {
 });
 
 /** GET /api/auth/google/callback
- * Exchanges the authorization code, verifies the ID token, links/creates a user,
- * issues your JWT, and redirects back to the frontend with #token in the hash.
+ * Exchanges the code, verifies the ID token, links/creates a user,
+ * issues your JWT, and redirects back to the SPA.
  */
 router.get("/google/callback", async (req, res) => {
   try {
@@ -448,21 +449,28 @@ router.get("/google/callback", async (req, res) => {
     const payload = ticket.getPayload();
 
     const googleId = payload?.sub || "";
-    const email    = String(payload?.email || "").toLowerCase();
-    const name     = payload?.name || email.split("@")[0];
-    const emailVerified = !!payload?.email_verified;
+    const email = String(payload?.email || "").toLowerCase();
+    const name = payload?.name || (email ? email.split("@")[0] : "User");
 
     if (!googleId || !email) {
       return res.status(400).send("Google profile missing id/email");
     }
 
-    // 🔗 Find or create the user (first by googleId, then by email)
+    // Find or create (prefer googleId, then email)
     let userRow;
-    const byGoogle = await query(`SELECT * FROM "User" WHERE "googleId" = $1 AND "deletedAt" IS NULL`, [googleId]);
+    const byGoogle = await query(
+      `SELECT * FROM "User" WHERE "googleId" = $1 AND "deletedAt" IS NULL`,
+      [googleId]
+    );
+
     if (byGoogle.rowCount) {
       userRow = byGoogle.rows[0];
     } else {
-      const byEmail = await query(`SELECT * FROM "User" WHERE email = $1 AND "deletedAt" IS NULL`, [email]);
+      const byEmail = await query(
+        `SELECT * FROM "User" WHERE email = $1 AND "deletedAt" IS NULL`,
+        [email]
+      );
+
       if (byEmail.rowCount) {
         // Link Google to existing account
         const up = await query(
@@ -478,49 +486,52 @@ router.get("/google/callback", async (req, res) => {
         );
         userRow = up.rows[0];
       } else {
-        // Create new user (defaults ACTIVE)
+        // Create new user — IMPORTANT: include a random password hash
+        const randomPass = `google:${googleId}:${crypto.randomUUID()}`;
+        const passwordHash = await bcrypt.hash(randomPass, 10);
+
         const created = await query(
           `INSERT INTO "User"
-             (id, email, name, role, status,
+             (id, email, name, "passwordHash", role, status,
               "createdAt","updatedAt","tokenVersion","mustChangePassword",
               "authProvider","googleId","lastLoginAt")
            VALUES
-             (gen_random_uuid()::text, $1, $2, $3, 'ACTIVE',
+             (gen_random_uuid()::text, $1, $2, $3, $4, 'ACTIVE',
               NOW(), NOW(), 0, false,
-              'GOOGLE', $4, NOW())
+              'GOOGLE', $5, NOW())
            RETURNING *`,
-          [email, name, role === "AGENT" ? "AGENT" : "STUDENT", googleId]
+          [email, name, passwordHash, role === "AGENT" ? "AGENT" : "STUDENT", googleId]
         );
         userRow = created.rows[0];
       }
     }
 
+    // Block suspended accounts (optional)
     if (userRow.status === "SUSPENDED") {
-      // Hard stop for suspended accounts
-      return res.redirect(
-        `${String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "")}/login?error=account_suspended`
-      );
+      const FRONTEND = String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
+      return res.redirect(`${FRONTEND}/login?error=account_suspended`);
     }
 
-    // Update last login (in case we hit the googleId branch)
+    // Touch last login
     await query(
       `UPDATE "User" SET "lastLoginAt" = NOW(), "updatedAt" = NOW() WHERE id = $1`,
       [userRow.id]
     );
 
-    // Issue your normal JWT
+    // Issue JWT
     const token = signTokenFromUser(userRow);
 
-    // Where to send them in the SPA
+    // Decide target path
     const FRONTEND = String(process.env.FRONTEND_URL || "http://localhost:5173").replace(/\/+$/, "");
-    const to =
-      from ||
-      (userRow.role === "AGENT" ? "/dashboard/agent" : "/dashboard/student");
+    const to = from || (userRow.role === "AGENT" ? "/dashboard/agent" : "/dashboard/student");
 
-    // Put token in URL hash (avoids server logs / referrers)
-    res.redirect(`${FRONTEND}/oauth/callback#token=${encodeURIComponent(token)}&to=${encodeURIComponent(to)}`);
+    // Redirect with token in hash
+    res.redirect(
+      `${FRONTEND}/oauth/callback#token=${encodeURIComponent(token)}&to=${encodeURIComponent(to)}`
+    );
   } catch (e) {
-    console.error("Google OAuth error:", e);
+    // Temporary verbose logging to see DB issues like NOT NULL violations
+    console.error("Google OAuth error:", e?.code, e?.detail, e);
     res.status(500).send("OAuth failed");
   }
 });

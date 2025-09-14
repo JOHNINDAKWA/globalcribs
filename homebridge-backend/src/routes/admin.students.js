@@ -4,6 +4,7 @@ import { authRequired } from "../middleware/auth.js";
 import { requireRole } from "../middleware/requireRole.js";
 import { z } from "zod";
 import { query } from "../db.js";
+import { notifyStudentConversationEmail } from "../lib/mailer.js";
 
 const router = Router();
 
@@ -427,6 +428,265 @@ router.patch(
     });
 
     res.json({ ok: true, doc: presentDoc(updated.rows[0]) });
+  }
+);
+
+// ==== Conversations (Admin ↔ Student) =======================================
+const NewThreadBody = z.object({
+  subject: z.string().min(1).max(200),
+  body: z.string().min(1).max(5000),
+  bookingId: z.string().optional().nullable(),
+});
+
+const ReplyBody = z.object({
+  body: z.string().min(1).max(5000),
+});
+
+// List threads for a student (with last message + booking/listing summary)
+router.get(
+  "/:id/messages",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const studentId = req.params.id;
+
+    const { rows } = await query(
+      `
+      SELECT
+        t.id,
+        t.subject,
+        t.status,
+        t."bookingId",
+        t."createdAt",
+        t."updatedAt",
+        b.id            AS "bk_id",
+        b."checkIn"     AS "bk_checkIn",
+        b."checkOut"    AS "bk_checkOut",
+        l.title         AS "listingTitle",
+        l.city          AS "listingCity",
+        lm."m_id",
+        lm."m_body",
+        lm."m_sender",
+        lm."m_createdAt"
+      FROM "MessageThread" t
+      LEFT JOIN "Booking" b     ON b.id = t."bookingId"
+      LEFT JOIN "Listing" l     ON l.id = b."listingId"
+      LEFT JOIN LATERAL (
+        SELECT m.id AS "m_id", m.body AS "m_body", m."senderType" AS "m_sender", m."createdAt" AS "m_createdAt"
+        FROM "Message" m
+        WHERE m."threadId" = t.id
+        ORDER BY m."createdAt" DESC
+        LIMIT 1
+      ) lm ON TRUE
+      WHERE t."studentId" = $1
+      ORDER BY t."updatedAt" DESC
+      `,
+      [studentId]
+    );
+
+    const items = rows.map((r) => ({
+      id: r.id,
+      subject: r.subject || "General",
+      status: r.status || "OPEN",
+      booking: r.bk_id
+        ? {
+            id: r.bk_id,
+            checkIn: r.bk_checkIn,
+            checkOut: r.bk_checkOut,
+            listingTitle: r.listingTitle || "",
+            city: r.listingCity || "",
+          }
+        : null,
+      lastMessage: r.m_id
+        ? {
+            id: r.m_id,
+            sender: r.m_sender,
+            body: r.m_body,
+            createdAt: r.m_createdAt,
+          }
+        : null,
+      createdAt: r.createdAt,
+      updatedAt: r.updatedAt,
+    }));
+
+    res.json({ items });
+  }
+);
+
+// Get full thread (messages)
+router.get(
+  "/:id/messages/:threadId",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const studentId = req.params.id;
+    const threadId = req.params.threadId;
+
+    const t = await query(
+      `SELECT * FROM "MessageThread" WHERE id = $1 AND "studentId" = $2`,
+      [threadId, studentId]
+    );
+    const thread = t.rows[0];
+    if (!thread) return res.status(404).json({ error: "Thread not found" });
+
+    const msgs = (
+      await query(
+        `SELECT id, "senderType" AS sender, "senderId", body, "createdAt"
+         FROM "Message"
+         WHERE "threadId" = $1
+         ORDER BY "createdAt" ASC`,
+        [threadId]
+      )
+    ).rows;
+
+    res.json({
+      thread: {
+        id: thread.id,
+        subject: thread.subject || "General",
+        status: thread.status || "OPEN",
+        bookingId: thread.bookingId || null,
+        createdAt: thread.createdAt,
+        updatedAt: thread.updatedAt,
+      },
+      messages: msgs,
+    });
+  }
+);
+
+// Reply inside a thread (ADMIN -> STUDENT) + email notify student
+router.post(
+  "/:id/messages/:threadId/reply",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const studentId = req.params.id;
+    const threadId = req.params.threadId;
+
+    const parsed = ReplyBody.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.flatten() });
+    }
+
+    const t = await query(
+      `SELECT id FROM "MessageThread" WHERE id = $1 AND "studentId" = $2`,
+      [threadId, studentId]
+    );
+    if (!t.rows[0]) return res.status(404).json({ error: "Thread not found" });
+
+    const { rows: mrows } = await query(
+      `INSERT INTO "Message"(id, "threadId", "senderType", "senderRole", "senderId", body, "createdAt")
+       VALUES (gen_random_uuid()::text, $1, 'ADMIN', 'ADMIN', $2, $3, NOW())
+       RETURNING id, "senderType" AS sender, "senderId", body, "createdAt"`,
+      [threadId, req.user.id, parsed.data.body]
+    );
+
+    await query(`UPDATE "MessageThread" SET "updatedAt" = NOW() WHERE id = $1`, [threadId]);
+
+    res.status(201).json({ message: mrows[0] });
+
+    // ---- Email notify the student (fire-and-forget) ----
+    try {
+      const stu = await query(
+        `SELECT name, email FROM "User" WHERE id = $1 AND role='STUDENT' AND "deletedAt" IS NULL`,
+        [studentId]
+      );
+      const student = stu.rows[0];
+
+      const meta = await query(
+        `
+        SELECT t.subject, l.title AS "listingTitle"
+        FROM "MessageThread" t
+        LEFT JOIN "Booking" b ON b.id = t."bookingId"
+        LEFT JOIN "Listing" l ON l.id = b."listingId"
+        WHERE t.id = $1
+        `,
+        [threadId]
+      );
+      const subject =
+        meta.rows[0]?.subject ||
+        (meta.rows[0]?.listingTitle ? `Update about ${meta.rows[0].listingTitle}` : "New message from Support");
+
+      if (student?.email) {
+        notifyStudentConversationEmail({
+          to: student.email,
+          subject,
+          body: parsed.data.body,
+          threadId,
+          studentName: student.name || "",
+        }).catch((e) => console.warn("notifyStudentConversationEmail failed:", e.message));
+      }
+    } catch (e) {
+      console.warn("Email dispatch (admin reply) failed:", e.message);
+    }
+  }
+);
+
+// Start a new thread for a student (optional bookingId) + email notify student
+router.post(
+  "/:id/messages",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const studentId = req.params.id;
+    const parsed = NewThreadBody.safeParse(req.body || {});
+    if (!parsed.success) {
+      return res.status(400).json({ error: parsed.error.flatten() });
+    }
+    const { subject, body, bookingId } = parsed.data;
+
+    // (Optional) validate booking belongs to the same student
+    if (bookingId) {
+      const ok = await query(
+        `SELECT id FROM "Booking" WHERE id = $1 AND "studentId" = $2`,
+        [bookingId, studentId]
+      );
+      if (!ok.rows[0]) return res.status(400).json({ error: "Invalid bookingId for this student" });
+    }
+
+    const t = await query(
+      `INSERT INTO "MessageThread"(id, "studentId", "bookingId", subject, status, "createdAt", "updatedAt")
+       VALUES (gen_random_uuid()::text, $1, $2, $3, 'OPEN', NOW(), NOW())
+       RETURNING *`,
+      [studentId, bookingId || null, subject]
+    );
+    const thread = t.rows[0];
+
+    await query(
+      `INSERT INTO "Message"(id, "threadId", "senderType", "senderRole", "senderId", body, "createdAt")
+       VALUES (gen_random_uuid()::text, $1, 'ADMIN', 'ADMIN', $2, $3, NOW())`,
+      [thread.id, req.user.id, body]
+    );
+
+    res.status(201).json({
+      thread: {
+        id: thread.id,
+        subject: thread.subject || "General",
+        status: thread.status || "OPEN",
+        bookingId: thread.bookingId || null,
+        createdAt: thread.createdAt,
+        updatedAt: thread.updatedAt,
+      },
+    });
+
+    // ---- Email notify the student (fire-and-forget) ----
+    try {
+      const stu = await query(
+        `SELECT name, email FROM "User" WHERE id = $1 AND role='STUDENT' AND "deletedAt" IS NULL`,
+        [studentId]
+      );
+      const student = stu.rows[0];
+      if (student?.email) {
+        notifyStudentConversationEmail({
+          to: student.email,
+          subject: subject || "New message from Support",
+          body,
+          threadId: thread.id,
+          studentName: student.name || "",
+        }).catch((e) => console.warn("notifyStudentConversationEmail failed:", e.message));
+      }
+    } catch (e) {
+      console.warn("Email dispatch (admin new thread) failed:", e.message);
+    }
   }
 );
 

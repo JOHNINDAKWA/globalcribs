@@ -389,6 +389,30 @@ router.post("/", authRequired, async (req, res) => {
     const b = await loadBookingWithRelations(rows[0].id);
     const item = presentBooking(b, true, { offer: "full" });
 
+     // NEW: if the student sent a note, mirror it into the messaging system
+ if (parsed.data.note && parsed.data.note.trim().length > 0) {
+   try {
+     // ensure (student, booking) thread exists
+     const thr = await query(
+       `INSERT INTO "MessageThread"(id, "studentId", "bookingId", "createdAt", "updatedAt")
+        VALUES (gen_random_uuid()::text, $1, $2, NOW(), NOW())
+        ON CONFLICT ("studentId","bookingId") WHERE "bookingId" IS NOT NULL
+        DO UPDATE SET "updatedAt" = NOW()
+        RETURNING id`,
+       [req.user.id, item.id]
+     );
+     const threadId = thr.rows[0].id;
+     await query(
+      `INSERT INTO "Message"(id, "threadId", "senderRole", "senderId", body, "createdAt")
+        VALUES (gen_random_uuid()::text, $1, 'STUDENT', $2, $3, NOW())`,
+       [threadId, req.user.id, parsed.data.note]
+     );
+   } catch (e) {
+     // don't block booking creation if messaging insert fails
+     console.error("mirror note -> messages failed:", e?.message || e);
+   }
+ }
+
     // fire-and-forget student email (do not block the response)
     (async () => {
       try {
