@@ -21,10 +21,40 @@ function ensureAdmin(req, res) {
   return true;
 }
 
+/** Defaults extended with payment-related configuration */
 const DEFAULTS = {
-  org: { name: "HomeBridge", logo: "", supportEmail: "support@homebridge.test", supportPhone: "+1 (555) 010-2323", website: "https://homebridge.test", timezone: "UTC" },
+  org: {
+    name: "GlobalCribs",
+    logo: "",
+    supportEmail: "support@globalcribs.org",
+    supportPhone: "+1 (555) 010-2323",
+    website: "https://www.globalcribs.org",
+    timezone: "UTC",
+  },
   security: { twoFactorRequired: false, sessionTimeoutMins: 60, allowIpRanges: "" },
-  fees: { currency: "USD", applicationFeeCents: 2500, escrowEnabled: true, escrowReleaseDays: 2 },
+
+  /** FEES now includes agent onboarding fee + bank (escrow/payout) details */
+  fees: {
+    currency: "USD",
+    /** Student registration/application fee (was static $25) */
+    applicationFeeCents: 2500,
+    /** One-time agent/landlord onboarding fee */
+    agentOnboardingFeeCents: 10000,
+    escrowEnabled: true,
+    escrowReleaseDays: 2,
+    /** Bank details to receive fees / act as escrow (display-only; NOT Stripe keys) */
+    bank: {
+      accountName: "",
+      bankName: "",
+      accountNumber: "",
+      branch: "",
+      routingNumber: "",
+      iban: "",
+      swift: "",
+      notes: "",
+    },
+  },
+
   kyc: { passport: true, admission: true, financial: true, i20: false, visa: false },
   notifications: { newBookingEmail: true, newBookingSMS: false, statusChangeEmail: true, statusChangeSMS: false },
 };
@@ -46,8 +76,19 @@ const SettingsSchema = z.object({
   fees: z.object({
     currency: z.enum(["USD", "KES", "EUR", "GBP"]),
     applicationFeeCents: z.number().int().min(0),
+    agentOnboardingFeeCents: z.number().int().min(0),
     escrowEnabled: z.boolean(),
     escrowReleaseDays: z.number().int().min(0).max(30),
+    bank: z.object({
+      accountName: z.string().optional().default(""),
+      bankName: z.string().optional().default(""),
+      accountNumber: z.string().optional().default(""),
+      branch: z.string().optional().default(""),
+      routingNumber: z.string().optional().default(""),
+      iban: z.string().optional().default(""),
+      swift: z.string().optional().default(""),
+      notes: z.string().optional().default(""),
+    }),
   }),
   kyc: z.object({
     passport: z.boolean(),
@@ -68,7 +109,14 @@ function deepMerge(base, patch) {
   const out = Array.isArray(base) ? [...base] : { ...base };
   for (const k of Object.keys(patch || {})) {
     const v = patch[k];
-    if (v && typeof v === "object" && !Array.isArray(v) && base?.[k] && typeof base[k] === "object" && !Array.isArray(base[k])) {
+    if (
+      v &&
+      typeof v === "object" &&
+      !Array.isArray(v) &&
+      base?.[k] &&
+      typeof base[k] === "object" &&
+      !Array.isArray(base[k])
+    ) {
       out[k] = deepMerge(base[k], v);
     } else {
       out[k] = v;

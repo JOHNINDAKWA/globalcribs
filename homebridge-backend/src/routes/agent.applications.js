@@ -236,36 +236,92 @@ router.get("/", ensureAgentOrAdmin, async (req, res) => {
 });
 
 // DETAIL
-router.get("/:id", ensureAgentOrAdmin, async (req, res) => {
-  try {
-    const agentId = req.user.id;
-    const id = req.params.id;
+ router.get("/:id", ensureAgentOrAdmin, async (req, res) => {
+   try {
+     const agentId = req.user.id;
+     const id = req.params.id;
 
-    const b = await loadBookingWithRelations(id);
-    if (!b) return res.status(404).json({ error: "Not found" });
-    if (!ensureAgentOwnsBooking(agentId, b)) return res.status(403).json({ error: "Forbidden" });
+     const b = await loadBookingWithRelations(id);
+     if (!b) return res.status(404).json({ error: "Not found" });
+     if (!ensureAgentOwnsBooking(agentId, b)) return res.status(403).json({ error: "Forbidden" });
 
-    // Load docs by docIds for that student
-    let docs = [];
-    if (Array.isArray(b.docIds) && b.docIds.length) {
-      const { rows: drows } = await query(
+     // Load docs by docIds for that student
+     let docs = [];
+     if (Array.isArray(b.docIds) && b.docIds.length) {
+       const { rows: drows } = await query(
+         `
+         SELECT id, filename, url, size, category, "createdAt"
+         FROM "StudentDoc"
+         WHERE "userId" = $1 AND id = ANY($2::text[])
+         ORDER BY "createdAt" DESC
+         `,
+         [b.studentId, b.docIds]
+       );
+       docs = drows;
+     }
+
+
+    const payRes = await query(
+      `
+SELECT
+  id, type, status, "amountCents", currency, "receiptUrl",
+  "stripePaymentIntentId", "stripeCheckoutSessionId",
+  "cardBrand", "cardLast4",
+  to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt"
+FROM "StudentPayment"
+WHERE "bookingId" = $1 AND type = 'OFFER_NOW'
+ORDER BY "createdAt" DESC;
+
+      `,
+      [b.id]
+    );
+    const payments = payRes.rows.map((p) => ({
+      id: p.id,
+      type: p.type,                         // 'OFFER_NOW'
+      status: p.status,                     // 'succeeded' | 'processing' | 'failed'
+      amountCents: p.amountCents || 0,
+      currency: (p.currency || "USD").toUpperCase(),
+      receiptUrl: p.receiptUrl || null,
+      cardBrand: p.cardBrand || null,
+      cardLast4: p.cardLast4 || null,
+      createdAt: p.createdAt,
+    }));
+
+    // NEW: Refund requests for those payments (if any)
+    const paymentIds = payments.map((p) => p.id);
+    let refunds = [];
+    if (paymentIds.length) {
+      const rr = await query(
         `
-        SELECT id, filename, url, size, category, "createdAt"
-        FROM "StudentDoc"
-        WHERE "userId" = $1 AND id = ANY($2::text[])
+        SELECT id, "paymentId", status, reason, "amountCents", currency, "createdAt", "processedAt"
+        FROM "RefundRequest"
+        WHERE "paymentId" = ANY($1::text[])
         ORDER BY "createdAt" DESC
         `,
-        [b.studentId, b.docIds]
+        [paymentIds]
       );
-      docs = drows;
+      refunds = rr.rows.map((r) => ({
+        id: r.id,
+        paymentId: r.paymentId,
+        status: r.status,                 // 'PENDING' | 'REFUNDED' | 'DECLINED'
+        reason: r.reason || "",
+        amountCents: r.amountCents || 0,
+        currency: (r.currency || "USD").toUpperCase(),
+        createdAt: r.createdAt,
+        processedAt: r.processedAt || null,
+      }));
     }
 
-    res.json({ item: toDetail(b, docs) });
-  } catch (e) {
-    console.error("GET /agent/applications/:id error:", e.message, e.detail);
-    res.status(500).json({ error: "Internal server error" });
-  }
-});
+    const detail = toDetail(b, docs);
+    detail.payments = payments;
+    detail.refunds = refunds;
+
+    res.json({ item: detail });
+   } catch (e) {
+     console.error("GET /agent/applications/:id error:", e.message, e.detail);
+     res.status(500).json({ error: "Internal server error" });
+   }
+ });
 
 // CONFIRM / SEND OFFER → create Offer row (+ set booking APPROVED for stage label)
 // Also: email the student that an offer is ready.

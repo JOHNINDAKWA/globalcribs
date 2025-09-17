@@ -55,36 +55,46 @@ router.get("/", async (req, res) => {
 
   const order = sort === "oldest" ? `"createdAt" ASC` : `"createdAt" DESC`;
 
+  // Count first
   const countSql = `SELECT COUNT(*)::int AS c FROM "SupportTicket" WHERE ${where.join(" AND ")}`;
   const { rows: c } = await query(countSql, params);
   const total = c[0]?.c || 0;
 
+  // Data
   params.push(take, skip);
   const dataSql = `
-    SELECT *
-      FROM "SupportTicket"
-     WHERE ${where.join(" AND ")}
-     ORDER BY ${order}
-     LIMIT $${params.length - 1} OFFSET $${params.length}`;
+    SELECT
+      id, name, email, topic, subject, message, "listingUrl", status, "assignedTo",
+      "createdAt"::timestamptz::text AS "createdAt",
+      "updatedAt"::timestamptz::text AS "updatedAt",
+      "lastReplyAt"::timestamptz::text AS "lastReplyAt"
+    FROM "SupportTicket"
+    WHERE ${where.join(" AND ")}
+    ORDER BY ${order}
+    LIMIT $${params.length - 1} OFFSET $${params.length}
+  `;
   const { rows } = await query(dataSql, params);
 
-  res.json({
-    items: rows.map(presentTicket),
-    total,
-  });
+  res.json({ items: rows.map(presentTicket), total });
 });
 
 /** GET /api/admin/inquiries/:id */
 router.get("/:id", async (req, res) => {
   const { rows } = await query(
-    `SELECT * FROM "SupportTicket" WHERE id = $1 AND "deletedAt" IS NULL`,
+    `SELECT
+       id, name, email, topic, subject, message, "listingUrl", status, "assignedTo",
+       "createdAt"::timestamptz::text AS "createdAt",
+       "updatedAt"::timestamptz::text AS "updatedAt",
+       "lastReplyAt"::timestamptz::text AS "lastReplyAt"
+     FROM "SupportTicket"
+     WHERE id = $1 AND "deletedAt" IS NULL`,
     [req.params.id]
   );
   if (!rows.length) return res.status(404).json({ error: "Not found" });
   res.json({ ticket: presentTicket(rows[0]) });
 });
 
-/** PATCH /api/admin/inquiries/:id  (status / assign) */
+/** PATCH /api/admin/inquiries/:id */
 router.patch("/:id", async (req, res) => {
   const Body = z.object({
     status: z.string().optional(),
@@ -115,12 +125,12 @@ router.patch("/:id", async (req, res) => {
   res.json({ ticket: presentTicket(rows[0]) });
 });
 
-/** POST /api/admin/inquiries/:id/replies  (send email + log) */
+/** POST /api/admin/inquiries/:id/replies */
 router.post("/:id/replies", async (req, res) => {
   const Body = z.object({
     subject: z.string().min(1).max(180).optional(),
     body: z.string().min(1),
-    setStatus: z.string().optional(), // optional: update status after reply
+    setStatus: z.string().optional(),
   });
   const parsed = Body.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -132,14 +142,12 @@ router.post("/:id/replies", async (req, res) => {
   const t = tks[0];
   if (!t) return res.status(404).json({ error: "Not found" });
 
-  // Send email
   await sendSupportReplyEmail({
     to: t.email,
     subject: parsed.data.subject || `Re: ${t.subject}`,
     body: parsed.data.body,
   });
 
-  // Log reply + touch ticket
   await query(
     `INSERT INTO "SupportReply"
        ("ticketId","adminUserId","toEmail",subject,body,"viaEmail","createdAt")
@@ -167,7 +175,7 @@ router.post("/:id/replies", async (req, res) => {
   res.json({ ticket: presentTicket(rows[0]) });
 });
 
-/** DELETE /api/admin/inquiries/:id  (soft delete) */
+/** DELETE /api/admin/inquiries/:id */
 router.delete("/:id", async (req, res) => {
   await query(
     `UPDATE "SupportTicket" SET "deletedAt" = now(), "updatedAt" = now() WHERE id = $1`,

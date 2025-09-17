@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { query, tx } from "../db.js";
 import { authRequired } from "../middleware/auth.js";
+import { requireOnboardingUnlocked } from "../middleware/requireOnboardingUnlocked.js";
 import { z } from "zod";
 import fs from "fs/promises";
 import path from "path";
@@ -188,7 +189,7 @@ router.get("/:id", authRequired, async (req, res) => {
 });
 
 // CREATE
-router.post("/", authRequired, async (req, res) => {
+router.post("/", authRequired, requireOnboardingUnlocked, async (req, res) => {
   if (!ensureAgent(req, res)) return;
   const parsed = CreateListingBody.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -256,7 +257,7 @@ router.post("/", authRequired, async (req, res) => {
 });
 
 // UPDATE (must own)
-router.put("/:id", authRequired, async (req, res) => {
+router.put("/:id", authRequired, requireOnboardingUnlocked, async (req, res) => {
   if (!ensureAgent(req, res)) return;
   const parsed = UpdateListingBody.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
@@ -362,7 +363,7 @@ router.put("/:id", authRequired, async (req, res) => {
 });
 
 // DELETE (must own) + delete files
-router.delete("/:id", authRequired, async (req, res) => {
+router.delete("/:id", authRequired, requireOnboardingUnlocked, async (req, res) => {
   if (!ensureAgent(req, res)) return;
   const listingId = req.params.id;
   const chk = await mustOwnListing(listingId, req.user.id);
@@ -382,7 +383,14 @@ router.delete("/:id", authRequired, async (req, res) => {
 // ---------- image management ----------
 
 // upload images
-router.post("/:id/images", authRequired, upload.array("images", MAX_FILES_PER_UPLOAD), async (req, res) => {
+
+// upload images  (NOTE: put the unlock check BEFORE multer)
+router.post("/:id/images",
+  authRequired,
+  requireOnboardingUnlocked,
+  upload.array("images", MAX_FILES_PER_UPLOAD),
+  async (req, res) => {
+
   if (!ensureAgent(req, res)) return;
 
   const listingId = req.params.id;
@@ -453,7 +461,9 @@ router.post("/:id/images", authRequired, upload.array("images", MAX_FILES_PER_UP
 });
 
 // set cover
-router.patch("/:id/cover/:imageId", authRequired, async (req, res) => {
+// set cover
+router.patch("/:id/cover/:imageId", authRequired, requireOnboardingUnlocked, async (req, res) => {
+
   if (!ensureAgent(req, res)) return;
 
   const listingId = req.params.id;
@@ -472,8 +482,10 @@ router.patch("/:id/cover/:imageId", authRequired, async (req, res) => {
   res.json({ listing: { ...l, ref: `LS-${shortFromUUID(l.id)}` } });
 });
 
+
 // delete image
-router.delete("/:id/images/:imageId", authRequired, async (req, res) => {
+router.delete("/:id/images/:imageId", authRequired, requireOnboardingUnlocked, async (req, res) => {
+
   if (!ensureAgent(req, res)) return;
 
   const listingId = req.params.id;

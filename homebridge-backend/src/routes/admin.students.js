@@ -8,7 +8,9 @@ import { notifyStudentConversationEmail } from "../lib/mailer.js";
 
 const router = Router();
 
-const API_PUBLIC_URL = (process.env.API_PUBLIC_URL || "http://localhost:4000").replace(/\/$/, "");
+const API_PUBLIC_URL = (
+  process.env.API_PUBLIC_URL || "http://localhost:4000"
+).replace(/\/$/, "");
 
 // ---- helpers ----
 const mapUserStatusOut = (s) =>
@@ -82,10 +84,8 @@ router.get(
         u.email,
         u.phone,
         u.status,
-        u."createdAt"                                      AS "u_createdAt",
-        COALESCE(u."lastLoginAt", u."updatedAt", u."createdAt") AS "u_lastActiveAt",
-
-        sp.id            AS "spId",
+        u."createdAt"::timestamptz::text           AS "u_createdAt",
+        COALESCE(u."lastLoginAt", sp."updatedAt", u."updatedAt", u."createdAt")::timestamptz::text AS "u_lastActiveAt",
         sp."avatarUrl"   AS "sp_avatarUrl",
         sp.school        AS "sp_school",
         sp.program       AS "sp_program",
@@ -93,7 +93,6 @@ router.get(
         sp."targetCity"  AS "sp_targetCity",
         sp."adminNotes"  AS "sp_adminNotes",
         sp."kycStatus"   AS "sp_kycStatus",
-
         (SELECT COUNT(*)::int FROM "Booking" b WHERE b."studentId" = u.id) AS bookings
       FROM "User" u
       LEFT JOIN "StudentProfile" sp ON sp."userId" = u.id
@@ -182,9 +181,8 @@ router.get(
         u.email                 AS "u_email",
         u.phone                 AS "u_phone",
         u.status                AS "u_status",
-        u."createdAt"           AS "u_createdAt",
-        COALESCE(u."lastLoginAt", u."updatedAt", u."createdAt") AS "u_lastActiveAt",
-
+        u."createdAt"::timestamptz::text           AS "u_createdAt",
+        COALESCE(u."lastLoginAt", sp."updatedAt", u."updatedAt", u."createdAt")::timestamptz::text AS "u_lastActiveAt",
         sp."avatarUrl"          AS "sp_avatarUrl",
         sp.school               AS "sp_school",
         sp.program              AS "sp_program",
@@ -195,25 +193,29 @@ router.get(
       FROM "User" u
       LEFT JOIN "StudentProfile" sp ON sp."userId" = u.id
       WHERE u.id = $1
+
       `,
       [req.params.id]
     );
 
     // confirm student role & not deleted
-    const roleRow = await query(`SELECT role, "deletedAt" FROM "User" WHERE id=$1`, [req.params.id]);
+    const roleRow = await query(
+      `SELECT role, "deletedAt" FROM "User" WHERE id=$1`,
+      [req.params.id]
+    );
     const role = roleRow.rows[0];
     const u = uRes.rows[0];
     if (!u || !role || role.role !== "STUDENT" || role.deletedAt) {
       return res.status(404).json({ error: "Student not found" });
     }
 
-    // Documents (include status; alias createdAt for consistency)
+    // Documents
     const docs = (
       await query(
         `
         SELECT
           id, filename, mime, size, url, category, status,
-          "createdAt" AS "createdAt"
+          "createdAt"::timestamptz::text AS "createdAt"
         FROM "StudentDoc"
         WHERE "userId" = $1
         ORDER BY "createdAt" DESC
@@ -229,9 +231,9 @@ router.get(
         SELECT
           b.id                     AS "b_id",
           b.status                 AS "b_status",
-          b."checkIn"              AS "b_checkIn",
-          b."checkOut"             AS "b_checkOut",
-          b."createdAt"            AS "b_createdAt",
+          b."checkIn"::timestamptz::text   AS "b_checkIn",
+          b."checkOut"::timestamptz::text  AS "b_checkOut",
+          b."createdAt"::timestamptz::text AS "b_createdAt",
           b."docIds"               AS "b_docIds",
           l.id                     AS "l_id",
           l.title                  AS "l_title",
@@ -240,6 +242,54 @@ router.get(
         JOIN "Listing" l ON l.id = b."listingId"
         WHERE b."studentId" = $1
         ORDER BY b."createdAt" DESC
+        `,
+        [u.u_id]
+      )
+    ).rows;
+
+    // Payments
+    const payments = (
+      await query(
+        `
+        SELECT
+          p.id,
+          p.type,
+          p."bookingId",
+          p."amountCents",
+          p.currency,
+          p.status,
+          p."stripePaymentIntentId",
+          p."receiptUrl",
+          p."cardBrand",
+          p."cardLast4",
+          p."createdAt"::timestamptz::text AS "createdAt",
+          l.title AS "listingTitle"
+        FROM "StudentPayment" p
+        LEFT JOIN "Booking" b ON b.id = p."bookingId"
+        LEFT JOIN "Listing" l ON l.id = b."listingId"
+        WHERE p."userId" = $1
+        ORDER BY p."createdAt" DESC
+        `,
+        [u.u_id]
+      )
+    ).rows;
+
+    // Refunds
+    const refunds = (
+      await query(
+        `
+        SELECT
+          r.id,
+          r."paymentId",
+          r."amountCents",
+          r.currency,
+          r.reason,
+          r.status,
+          r."createdAt"::timestamptz::text   AS "createdAt",
+          r."processedAt"::timestamptz::text AS "processedAt"
+        FROM "RefundRequest" r
+        WHERE r."userId" = $1
+        ORDER BY r."createdAt" DESC
         `,
         [u.u_id]
       )
@@ -254,7 +304,9 @@ router.get(
       mime: d.mime,
       size: d.size,
       url: d.url,
-      downloadUrl: d.url?.startsWith("http") ? d.url : `${API_PUBLIC_URL}${d.url}`,
+      downloadUrl: d.url?.startsWith("http")
+        ? d.url
+        : `${API_PUBLIC_URL}${d.url}`,
       category: d.category || "Other",
       status: d.status || "Pending",
       createdAt: d.createdAt,
@@ -304,6 +356,8 @@ router.get(
 
       docs: docs.map(presentDoc),
       bookings: bookings.map(presentBooking),
+      payments,
+      refunds,
     };
 
     res.json({ item });
@@ -316,11 +370,17 @@ router.patch(
   authRequired,
   requireRole("ADMIN", "SUPERADMIN"),
   async (req, res) => {
-    const Body = z.object({ kycStatus: z.enum(["Passed", "Pending", "Failed"]) });
+    const Body = z.object({
+      kycStatus: z.enum(["Passed", "Pending", "Failed"]),
+    });
     const parsed = Body.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    if (!parsed.success)
+      return res.status(400).json({ error: parsed.error.flatten() });
 
-    const usr = await query(`SELECT id, role, "deletedAt" FROM "User" WHERE id = $1`, [req.params.id]);
+    const usr = await query(
+      `SELECT id, role, "deletedAt" FROM "User" WHERE id = $1`,
+      [req.params.id]
+    );
     const u = usr.rows[0];
     if (!u || u.role !== "STUDENT" || u.deletedAt) {
       return res.status(404).json({ error: "Student not found" });
@@ -348,9 +408,13 @@ router.patch(
   async (req, res) => {
     const Body = z.object({ status: z.enum(["Active", "Suspended"]) });
     const parsed = Body.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    if (!parsed.success)
+      return res.status(400).json({ error: parsed.error.flatten() });
 
-    const usr = await query(`SELECT id, role, "deletedAt" FROM "User" WHERE id = $1`, [req.params.id]);
+    const usr = await query(
+      `SELECT id, role, "deletedAt" FROM "User" WHERE id = $1`,
+      [req.params.id]
+    );
     const u = usr.rows[0];
     if (!u || u.role !== "STUDENT" || u.deletedAt) {
       return res.status(404).json({ error: "Student not found" });
@@ -372,9 +436,13 @@ router.patch(
   async (req, res) => {
     const Body = z.object({ notes: z.string().optional().default("") });
     const parsed = Body.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    if (!parsed.success)
+      return res.status(400).json({ error: parsed.error.flatten() });
 
-    const usr = await query(`SELECT id, role, "deletedAt" FROM "User" WHERE id = $1`, [req.params.id]);
+    const usr = await query(
+      `SELECT id, role, "deletedAt" FROM "User" WHERE id = $1`,
+      [req.params.id]
+    );
     const u = usr.rows[0];
     if (!u || u.role !== "STUDENT" || u.deletedAt) {
       return res.status(404).json({ error: "Student not found" });
@@ -400,11 +468,16 @@ router.patch(
   authRequired,
   requireRole("ADMIN", "SUPERADMIN"),
   async (req, res) => {
-    const Body = z.object({ status: z.enum(["Verified", "Rejected", "Pending"]) });
+    const Body = z.object({
+      status: z.enum(["Verified", "Rejected", "Pending"]),
+    });
     const parsed = Body.safeParse(req.body);
-    if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
+    if (!parsed.success)
+      return res.status(400).json({ error: parsed.error.flatten() });
 
-    const dRes = await query(`SELECT * FROM "StudentDoc" WHERE id = $1`, [req.params.docId]);
+    const dRes = await query(`SELECT * FROM "StudentDoc" WHERE id = $1`, [
+      req.params.docId,
+    ]);
     const d = dRes.rows[0];
     if (!d || d.userId !== req.params.id) {
       return res.status(404).json({ error: "Document not found" });
@@ -421,7 +494,9 @@ router.patch(
       mime: x.mime,
       size: x.size,
       url: x.url,
-      downloadUrl: x.url?.startsWith("http") ? x.url : `${API_PUBLIC_URL}${x.url}`,
+      downloadUrl: x.url?.startsWith("http")
+        ? x.url
+        : `${API_PUBLIC_URL}${x.url}`,
       category: x.category || "Other",
       status: x.status || "Pending",
       createdAt: x.createdAt,
@@ -580,7 +655,10 @@ router.post(
       [threadId, req.user.id, parsed.data.body]
     );
 
-    await query(`UPDATE "MessageThread" SET "updatedAt" = NOW() WHERE id = $1`, [threadId]);
+    await query(
+      `UPDATE "MessageThread" SET "updatedAt" = NOW() WHERE id = $1`,
+      [threadId]
+    );
 
     res.status(201).json({ message: mrows[0] });
 
@@ -604,7 +682,9 @@ router.post(
       );
       const subject =
         meta.rows[0]?.subject ||
-        (meta.rows[0]?.listingTitle ? `Update about ${meta.rows[0].listingTitle}` : "New message from Support");
+        (meta.rows[0]?.listingTitle
+          ? `Update about ${meta.rows[0].listingTitle}`
+          : "New message from Support");
 
       if (student?.email) {
         notifyStudentConversationEmail({
@@ -613,7 +693,9 @@ router.post(
           body: parsed.data.body,
           threadId,
           studentName: student.name || "",
-        }).catch((e) => console.warn("notifyStudentConversationEmail failed:", e.message));
+        }).catch((e) =>
+          console.warn("notifyStudentConversationEmail failed:", e.message)
+        );
       }
     } catch (e) {
       console.warn("Email dispatch (admin reply) failed:", e.message);
@@ -640,7 +722,10 @@ router.post(
         `SELECT id FROM "Booking" WHERE id = $1 AND "studentId" = $2`,
         [bookingId, studentId]
       );
-      if (!ok.rows[0]) return res.status(400).json({ error: "Invalid bookingId for this student" });
+      if (!ok.rows[0])
+        return res
+          .status(400)
+          .json({ error: "Invalid bookingId for this student" });
     }
 
     const t = await query(
@@ -682,7 +767,9 @@ router.post(
           body,
           threadId: thread.id,
           studentName: student.name || "",
-        }).catch((e) => console.warn("notifyStudentConversationEmail failed:", e.message));
+        }).catch((e) =>
+          console.warn("notifyStudentConversationEmail failed:", e.message)
+        );
       }
     } catch (e) {
       console.warn("Email dispatch (admin new thread) failed:", e.message);

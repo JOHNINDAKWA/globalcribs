@@ -88,6 +88,7 @@ router.get(
 // ... rest of the file remains the same
 
 // GET /api/admin/bookings/:id
+// GET /api/admin/bookings/:id
 router.get(
   "/:id",
   authRequired,
@@ -101,20 +102,21 @@ router.get(
         b."checkIn",
         b."checkOut",
         b.note,
-        b."feePaidAt"::text AS "feePaidAt",
+        b."feePaidAt"::text   AS "feePaidAt",
         b."submittedAt"::text AS "submittedAt",
-        b."createdAt"::text AS "createdAt",
+        b."createdAt"::text   AS "createdAt",
         b."docsUpdatedAt"::text AS "docsUpdatedAt",
         b."docIds",
         l.id AS "l_id", l.title AS "l_title", l.city AS "l_city", l."coverImageId" AS "l_cover",
         u.id AS "u_id", u.name AS "u_name", u.email AS "u_email"
       FROM "Booking" b
       JOIN "Listing" l ON l.id = b."listingId"
-      JOIN "User" u ON u.id = b."studentId"
+      JOIN "User"   u ON u.id = b."studentId"
       WHERE b.id = $1
       `,
       [req.params.id]
     );
+
     const b = base.rows[0];
     if (!b) return res.status(404).json({ error: "Booking not found" });
 
@@ -148,6 +150,73 @@ router.get(
       createdAt: d.createdAt,
     }));
 
+    // ---------- NEW: Payments scoped to THIS booking ----------
+    const paymentsRaw = (
+      await query(
+        `
+        SELECT
+          p.*,
+          p."createdAt"::text AS "createdAt",
+          l.title AS "listingTitle"
+        FROM "StudentPayment" p
+        LEFT JOIN "Booking" b2 ON b2.id = p."bookingId"
+        LEFT JOIN "Listing" l  ON l.id  = b2."listingId"
+        WHERE p."userId" = $1 AND p."bookingId" = $2
+        ORDER BY p."createdAt" DESC
+        `,
+        [b.u_id, b.id]
+      )
+    ).rows;
+
+    const presentPayment = (p) => ({
+      id: p.id,
+      type: p.type,                    // 'APP_FEE' | 'OFFER_NOW'
+      amountCents: p.amountCents,
+      currency: p.currency,
+      status: p.status,                // 'succeeded'
+      createdAt: p.createdAt,
+      bookingId: p.bookingId,
+      offerId: p.offerId,
+      receiptUrl: p.receiptUrl || null,
+      listingTitle: p.listingTitle || b.l_title,
+    });
+
+    const payments = paymentsRaw.map(presentPayment);
+
+    // ---------- NEW: Refund requests scoped to THIS booking ----------
+    const refundsRaw = (
+      await query(
+        `
+        SELECT
+          r.*,
+          r."createdAt"::text   AS "createdAt",
+          r."processedAt"::text AS "processedAt",
+          p."amountCents"       AS "p_amountCents",
+          p.currency            AS "p_currency"
+        FROM "RefundRequest" r
+        LEFT JOIN "StudentPayment" p ON p.id = r."paymentId"
+        WHERE r."userId" = $1 AND r."bookingId" = $2
+        ORDER BY r."createdAt" DESC
+        `,
+        [b.u_id, b.id]
+      )
+    ).rows;
+
+    const presentRefund = (r) => ({
+      id: r.id,
+      paymentId: r.paymentId,
+      bookingId: r.bookingId,
+      amountCents: r.amountCents,
+      currency: r.currency,
+      status: r.status,                // 'PENDING' | 'DECLINED' | 'REFUNDED'
+      reason: r.reason || "",
+      createdAt: r.createdAt,
+      processedAt: r.processedAt,
+      stripeRefundId: r.stripeRefundId || null,
+    });
+
+    const refunds = refundsRaw.map(presentRefund);
+
     const item = {
       id: b.id,
       displayId: prettyId(b.id, "BK"),
@@ -173,12 +242,16 @@ router.get(
         name: b.u_name || "",
         email: b.u_email || "",
       },
-      docsUpdatedAt: b.docsUpdatedAt
+      docsUpdatedAt: b.docsUpdatedAt,
+      // NEW: include these in the payload
+      payments,
+      refunds,
     };
 
     res.json({ item });
   }
 );
+
 
 // POST /api/admin/bookings/:id/decision
 router.post(
@@ -273,5 +346,148 @@ router.post(
     res.json({ item: up.rows[0] });
   }
 );
+
+
+
+// List payments explicitly (optional; detail already returns payments)
+router.get(
+  "/:id/payments",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const rows = (
+      await query(
+        `SELECT * FROM "StudentPayment" WHERE "userId" = $1 ORDER BY "createdAt" DESC`,
+        [req.params.id]
+      )
+    ).rows;
+    res.json({ items: rows });
+  }
+);
+
+// List refund requests for the student (optional; detail already returns refunds)
+router.get(
+  "/:id/refunds",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const rows = (
+      await query(
+        `SELECT * FROM "RefundRequest" WHERE "userId" = $1 ORDER BY "createdAt" DESC`,
+        [req.params.id]
+      )
+    ).rows;
+    res.json({ items: rows });
+  }
+);
+
+// Approve & execute a refund
+router.post(
+  "/:id/refunds/:refundId/approve",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    if (!stripe) return res.status(400).json({ error: "Stripe not configured" });
+
+    const rrRes = await query(
+      `SELECT r.*, p."stripeChargeId", p."stripePaymentIntentId"
+         FROM "RefundRequest" r
+         LEFT JOIN "StudentPayment" p ON p.id = r."paymentId"
+        WHERE r.id = $1 AND r."userId" = $2`,
+      [req.params.refundId, req.params.id]
+    );
+    const rr = rrRes.rows[0];
+    if (!rr) return res.status(404).json({ error: "Refund request not found" });
+    if (rr.status !== "PENDING")
+      return res.status(400).json({ error: "Refund already processed" });
+
+    try {
+      // Prefer charge id, else payment_intent
+      let refund;
+      if (rr.stripeChargeId) {
+        refund = await stripe.refunds.create({
+          charge: rr.stripeChargeId,
+          amount: rr.amountCents,
+        });
+      } else if (rr.stripePaymentIntentId) {
+        refund = await stripe.refunds.create({
+          payment_intent: rr.stripePaymentIntentId,
+          amount: rr.amountCents,
+        });
+      } else {
+        return res.status(400).json({ error: "No Stripe reference to refund" });
+      }
+
+      await query(
+        `UPDATE "RefundRequest"
+            SET status='REFUNDED',
+                "stripeRefundId"=$2,
+                "processedAt"=NOW(),
+                "updatedAt"=NOW()
+          WHERE id = $1`,
+        [rr.id, refund.id]
+      );
+
+      res.json({ ok: true, refundId: refund.id });
+    } catch (e) {
+      console.error("Stripe refund failed:", e);
+      res.status(500).json({ error: "Stripe refund failed" });
+    }
+  }
+);
+
+// Decline a refund request
+router.post(
+  "/:id/refunds/:refundId/decline",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const rr = await query(
+      `UPDATE "RefundRequest"
+          SET status='DECLINED', "processedAt"=NOW(), "updatedAt"=NOW()
+        WHERE id = $1 AND "userId" = $2 AND status='PENDING'
+        RETURNING *`,
+      [req.params.refundId, req.params.id]
+    );
+    if (!rr.rows[0]) return res.status(404).json({ error: "Not found or already processed" });
+    res.json({ ok: true });
+  }
+);
+
+// Quick refund (admin-initiated) for a specific payment
+router.post(
+  "/:id/payments/:paymentId/refund",
+  authRequired,
+  requireRole("ADMIN", "SUPERADMIN"),
+  async (req, res) => {
+    const pRes = await query(
+      `SELECT * FROM "StudentPayment" WHERE id=$1 AND "userId"=$2`,
+      [req.params.paymentId, req.params.id]
+    );
+    const pm = pRes.rows[0];
+    if (!pm) return res.status(404).json({ error: "Payment not found" });
+
+    // Create an RR row first (for audit), then immediately approve it
+    const { rows } = await query(
+      `INSERT INTO "RefundRequest"
+         (id,"userId","bookingId","paymentId","amountCents","currency",reason,status,
+          "createdAt","updatedAt")
+       VALUES (gen_random_uuid()::text,$1,$2,$3,$4,$5,$6,'PENDING',NOW(),NOW())
+       RETURNING *`,
+      [
+        pm.userId,
+        pm.bookingId,
+        pm.id,
+        pm.amountCents,
+        pm.currency,
+        String(req.body?.reason || "").slice(0, 1000) || null,
+      ]
+    );
+
+    req.params.refundId = rows[0].id; // reuse approve logic
+    return router.handle(req, res);   // fall through to route stack (will hit approve)
+  }
+);
+
 
 export default router;

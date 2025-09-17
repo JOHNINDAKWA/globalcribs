@@ -17,12 +17,14 @@ function randomKey(bytes = 24) {
 router.get("/me", authRequired, adminOnly, async (req, res) => {
   const { rows } = await query(
     `SELECT id, email, name, role, status, "adminScope", "twoFA", "apiKey",
-            "createdAt", "lastLoginAt"
+            to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
+            to_char("lastLoginAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "lastLoginAt"
      FROM "User" WHERE id = $1`,
     [req.user.id]
   );
   res.json({ user: rows[0] || null });
 });
+
 
 router.put("/me", authRequired, adminOnly, async (req, res) => {
   const Body = z.object({
@@ -88,13 +90,16 @@ router.post("/me/revoke-sessions", authRequired, adminOnly, async (req, res) => 
 // ---------- /api/admin/team ----------
 router.get("/team", authRequired, adminOnly, async (_req, res) => {
   const { rows } = await query(
-    `SELECT id, name, email, role, status, "adminScope", "twoFA", "createdAt", "lastLoginAt"
+    `SELECT id, name, email, role, status, "adminScope", "twoFA",
+            to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
+            to_char("lastLoginAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "lastLoginAt"
      FROM "User"
      WHERE role IN ('ADMIN','SUPERADMIN')
      ORDER BY "createdAt" DESC`
   );
   res.json({ team: rows });
 });
+
 
 router.post("/team/invite", authRequired, adminOnly, async (req, res) => {
   const Body = z.object({

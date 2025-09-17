@@ -167,6 +167,8 @@ router.get("/", authRequired, async (req, res) => {
   res.json({ items: shaped, total, take, skip });
 });
 
+
+
 /* ---------------- DETAIL ---------------- */
 router.get("/:id", authRequired, async (req, res) => {
   if (!ensureAdmin(req, res)) return;
@@ -193,17 +195,36 @@ router.get("/:id", authRequired, async (req, res) => {
     `,
     [id]
   );
+
+
   const row = base.rows[0];
+row.createdAt = row.createdAt?.toISOString?.() || null;
+row.updatedAt = row.updatedAt?.toISOString?.() || null;
+
+
+
   if (!row) return res.status(404).json({ error: "Not found" });
 
   const [imagesRes, unitsRes, reportsRes] = await Promise.all([
     query(
-      `SELECT id, url, "order" FROM "ListingImage" WHERE "listingId" = $1 ORDER BY "order" ASC`,
+      `SELECT id, url, "order"
+       FROM "ListingImage"
+       WHERE "listingId" = $1
+       ORDER BY "order" ASC`,
       [id]
     ),
-    query(`SELECT * FROM "ListingUnit" WHERE "listingId" = $1`, [id]),
     query(
-      `SELECT * FROM "ListingReport" WHERE "listingId" = $1 ORDER BY "createdAt" DESC LIMIT 50`,
+      `SELECT *
+       FROM "ListingUnit"
+       WHERE "listingId" = $1`,
+      [id]
+    ),
+    query(
+      `SELECT *
+       FROM "ListingReport"
+       WHERE "listingId" = $1
+       ORDER BY "createdAt" DESC
+       LIMIT 50`,
       [id]
     ),
   ]);
@@ -225,8 +246,20 @@ router.get("/:id", authRequired, async (req, res) => {
     ? { id: row.updatedById, name: row.updatedByName, email: row.updatedByEmail }
     : null;
 
-  const { agentId, agentName, agentEmail, orgName, phone, city, website, supportEmail, updatedById, updatedByName, updatedByEmail, ...listingCore } =
-    row;
+  // Strip helper-only fields
+  const {
+    agentName,
+    agentEmail,
+    orgName,
+    phone,
+    city,
+    website,
+    supportEmail,
+    updatedById,
+    updatedByName,
+    updatedByEmail,
+    ...listingCore
+  } = row;
 
   const item = presentListing({
     ...listingCore,
@@ -235,8 +268,15 @@ router.get("/:id", authRequired, async (req, res) => {
     updatedBy,
   });
 
-  res.json({ item: { ...item, agent, reports: reportsRes.rows } });
+  res.json({
+    item: {
+      ...item,
+      agent,
+      reports: reportsRes.rows,
+    },
+  });
 });
+
 
 /* ---------------- PATCH ---------------- */
 router.patch("/:id", authRequired, async (req, res) => {

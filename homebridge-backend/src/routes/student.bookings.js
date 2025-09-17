@@ -9,6 +9,52 @@ const APP_NAME = process.env.APP_NAME || "GlobalCribs";
 const FRONTEND_URL = process.env.FRONTEND_URL || "http://localhost:5173";
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || "johnindakwa6@gmail.com";
 
+
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || "";
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || "";
+const DEFAULT_CURRENCY = (process.env.DEFAULT_CURRENCY || "USD").toLowerCase();
+const STUDENT_APP_FEE_CENTS = Number(process.env.STUDENT_APP_FEE_CENTS || 2500);
+const BASE_URL = process.env.FRONTEND_URL || "http://localhost:5173";
+
+let stripe;
+if (STRIPE_SECRET_KEY) {
+  const { default: Stripe } = await import("stripe");
+  stripe = new Stripe(STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
+}
+
+// util: current app-fee for booking (DB column optional; fallback to env)
+async function getAppFeeCents(bookingId) {
+  const { rows } = await query(
+    `SELECT COALESCE("applicationFeeCents", $2)::int AS fee
+     FROM "Booking" WHERE id = $1`,
+    [bookingId, STUDENT_APP_FEE_CENTS]
+  );
+  return rows[0]?.fee ?? STUDENT_APP_FEE_CENTS;
+}
+
+// util: compute "due now" for latest offer (0 if none)
+async function getOfferDueNow(bookingId) {
+  const { rows } = await query(
+    `SELECT id, currency, lines
+       FROM "Offer"
+      WHERE "bookingId" = $1
+      ORDER BY "createdAt" DESC
+      LIMIT 1`,
+    [bookingId]
+  );
+  const o = rows[0];
+  if (!o) return { offerId: null, dueNow: 0, currency: DEFAULT_CURRENCY };
+  const lines = Array.isArray(o.lines) ? o.lines : [];
+  let dueNow = 0;
+  for (const l of lines) {
+    const amt = Number(l?.amountCents ?? 0);
+    const due = String(l?.dueType || "").toUpperCase();
+    if (due === "NOW") dueNow += amt;
+  }
+  const currency = (o.currency || DEFAULT_CURRENCY).toLowerCase();
+  return { offerId: o.id, dueNow, currency };
+}
+
 const router = Router();
 
 /* ---------- tiny helpers ---------- */
@@ -819,5 +865,228 @@ router.post("/:id/offer/decline", authRequired, async (req, res) => {
     res.status(500).json({ error: "Internal server error" });
   }
 });
+
+
+
+/* ---------------- Stripe-backed Student payments ---------------- */
+
+// Create PaymentIntent for application fee
+router.post("/:id/pay/app-fee/intent", authRequired, async (req, res) => {
+  if (!ensureStudent(req, res)) return;
+  if (!stripe || !STRIPE_PUBLISHABLE_KEY)
+    return res.status(400).json({ error: "Stripe not configured" });
+
+  const chk = await mustOwnBooking(req.params.id, req.user.id);
+  if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
+
+  try {
+    const amountCents = await getAppFeeCents(chk.booking.id);
+    const currency = DEFAULT_CURRENCY;
+
+    const pi = await stripe.paymentIntents.create({
+      amount: amountCents,
+      currency,
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        type: "student_app_fee",
+        userId: req.user.id,
+        bookingId: chk.booking.id,
+      },
+      receipt_email: req.user.email || undefined,
+    });
+
+    return res.json({
+      clientSecret: pi.client_secret,
+      publishableKey: STRIPE_PUBLISHABLE_KEY,
+      amountCents,
+      currency: currency.toUpperCase(),
+    });
+  } catch (e) {
+    console.error("app-fee intent error:", e);
+    res.status(500).json({ error: "Unable to create PaymentIntent" });
+  }
+});
+
+// Stripe Checkout for application fee
+router.post("/:id/pay/app-fee/checkout", authRequired, async (req, res) => {
+  if (!ensureStudent(req, res)) return;
+  if (!stripe) return res.status(400).json({ error: "Stripe not configured" });
+
+  const chk = await mustOwnBooking(req.params.id, req.user.id);
+  if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
+
+  try {
+    const amountCents = await getAppFeeCents(chk.booking.id);
+    const currency = DEFAULT_CURRENCY;
+
+    const successUrl = `${BASE_URL}/dashboard/student/bookings/${chk.booking.id}?paid=1`;
+    const cancelUrl = `${BASE_URL}/dashboard/student/bookings/${chk.booking.id}/pay/app-fee`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: req.user.email || undefined,
+      line_items: [
+        {
+          price_data: {
+            currency,
+            unit_amount: amountCents,
+            product_data: { name: "Application/Registration Fee" },
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        type: "student_app_fee",
+        userId: req.user.id,
+        bookingId: chk.booking.id,
+      },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+    });
+
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error("app-fee checkout error:", e);
+    res.status(500).json({ error: "Unable to start Stripe Checkout" });
+  }
+});
+
+// Create PaymentIntent for "offer due now"
+router.post("/:id/pay/offer/intent", authRequired, async (req, res) => {
+  if (!ensureStudent(req, res)) return;
+  if (!stripe || !STRIPE_PUBLISHABLE_KEY)
+    return res.status(400).json({ error: "Stripe not configured" });
+
+  const chk = await mustOwnBooking(req.params.id, req.user.id);
+  if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
+
+  try {
+    const { offerId, dueNow, currency } = await getOfferDueNow(chk.booking.id);
+    if (!offerId || dueNow <= 0)
+      return res.status(400).json({ error: "No payable amount due now" });
+
+    const pi = await stripe.paymentIntents.create({
+      amount: dueNow,
+      currency,
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        type: "student_offer_now",
+        userId: req.user.id,
+        bookingId: chk.booking.id,
+        offerId,
+      },
+      receipt_email: req.user.email || undefined,
+    });
+
+    return res.json({
+      clientSecret: pi.client_secret,
+      publishableKey: STRIPE_PUBLISHABLE_KEY,
+      amountCents: dueNow,
+      currency: currency.toUpperCase(),
+    });
+  } catch (e) {
+    console.error("offer intent error:", e);
+    res.status(500).json({ error: "Unable to create PaymentIntent" });
+  }
+});
+
+// Stripe Checkout for "offer due now"
+router.post("/:id/pay/offer/checkout", authRequired, async (req, res) => {
+  if (!ensureStudent(req, res)) return;
+  if (!stripe) return res.status(400).json({ error: "Stripe not configured" });
+
+  const chk = await mustOwnBooking(req.params.id, req.user.id);
+  if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
+
+  try {
+    const { offerId, dueNow, currency } = await getOfferDueNow(chk.booking.id);
+    if (!offerId || dueNow <= 0)
+      return res.status(400).json({ error: "No payable amount due now" });
+
+    const successUrl = `${BASE_URL}/dashboard/student/bookings/${chk.booking.id}?offerPaid=1`;
+    const cancelUrl = `${BASE_URL}/dashboard/student/bookings/${chk.booking.id}/pay/offer`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      customer_email: req.user.email || undefined,
+      line_items: [
+        {
+          price_data: {
+            currency,
+            unit_amount: dueNow,
+            product_data: { name: "Housing offer - Due now" },
+          },
+          quantity: 1,
+        },
+      ],
+      metadata: {
+        type: "student_offer_now",
+        userId: req.user.id,
+        bookingId: chk.booking.id,
+        offerId,
+      },
+      success_url: successUrl,
+      cancel_url: cancelUrl,
+    });
+
+    res.json({ url: session.url });
+  } catch (e) {
+    console.error("offer checkout error:", e);
+    res.status(500).json({ error: "Unable to start Stripe Checkout" });
+  }
+});
+
+
+// STUDENT -> request a refund for the most recent payment on this booking
+router.post("/:id/refund/request", authRequired, async (req, res) => {
+  if (!ensureStudent(req, res)) return;
+
+  const chk = await mustOwnBooking(req.params.id, req.user.id);
+  if (!chk.ok) return res.status(chk.status).json({ error: chk.error });
+
+  try {
+    // Try to find the latest successful payment on this booking
+    const pRes = await query(
+      `SELECT *
+         FROM "StudentPayment"
+        WHERE "bookingId" = $1 AND "userId" = $2 AND status = 'succeeded'
+        ORDER BY "createdAt" DESC
+        LIMIT 1`,
+      [chk.booking.id, req.user.id]
+    );
+    const pm = pRes.rows[0];
+    if (!pm) return res.status(400).json({ error: "No successful payment to refund." });
+
+    // If there is already a PENDING/REFUNDED request for this payment, stop
+    const existing = await query(
+      `SELECT *
+         FROM "RefundRequest"
+        WHERE "paymentId" = $1 AND status IN ('PENDING','REFUNDED')
+        ORDER BY "createdAt" DESC
+        LIMIT 1`,
+      [pm.id]
+    );
+    if (existing.rows[0]) {
+      return res.status(400).json({ error: "A refund has already been requested or processed." });
+    }
+
+    const reason = String(req.body?.reason || "").slice(0, 1000);
+    const { rows } = await query(
+      `INSERT INTO "RefundRequest"
+         (id, "userId","bookingId","paymentId","amountCents","currency", reason, status,
+          "createdAt","updatedAt")
+       VALUES (gen_random_uuid()::text, $1,$2,$3,$4,$5,$6,'PENDING', NOW(), NOW())
+       RETURNING *`,
+      [req.user.id, chk.booking.id, pm.id, pm.amountCents, pm.currency, reason || null]
+    );
+
+    res.status(201).json({ request: rows[0] });
+  } catch (e) {
+    console.error("refund request error:", e);
+    res.status(500).json({ error: "Unable to submit refund request" });
+  }
+});
+
+
 
 export default router;
